@@ -523,9 +523,19 @@ if [[ -d "${OVERLAY_SOURCE}/nemo_rl" ]]; then
   _append_mount "${OVERLAY_SOURCE}/nemo_rl:/opt/nemo-rl/nemo_rl"
   echo "  Mount: nemo_rl → /opt/nemo-rl/nemo_rl"
 fi
-if [[ -d "${OVERLAY_SOURCE}/examples/configs" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/examples/configs:/opt/nemo-rl/examples/configs"
-  echo "  Mount: configs → /opt/nemo-rl/examples/configs"
+# SC CHANGE: overlay the whole examples/ tree, not just examples/configs.
+# The container image (public main, 2026-07-26) predates this branch's SC
+# entrypoint examples/run_grpo_single_controller.py, so the driver would not
+# find it in the image's built-in tree.
+if [[ -d "${OVERLAY_SOURCE}/examples" ]]; then
+  _append_mount "${OVERLAY_SOURCE}/examples:/opt/nemo-rl/examples"
+  echo "  Mount: examples → /opt/nemo-rl/examples  (SC entrypoint; absent from this image)"
+fi
+# SC CHANGE: overlay experiment/ so CONFIG_PATH=experiment/change-akash/...
+# resolves inside the container (TRAIN_CMD does `cd /opt/nemo-rl`).
+if [[ -d "${OVERLAY_SOURCE}/experiment" ]]; then
+  _append_mount "${OVERLAY_SOURCE}/experiment:/opt/nemo-rl/experiment"
+  echo "  Mount: experiment → /opt/nemo-rl/experiment  (SC recipes/configs)"
 fi
 if [[ -d "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" ]]; then
   _append_mount "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
@@ -634,7 +644,7 @@ NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 HF_TOKEN=${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
-uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
+uv run ./examples/run_grpo_single_controller.py \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \

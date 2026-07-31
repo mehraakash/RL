@@ -58,10 +58,17 @@ cd "${REPO_ROOT}"   # ultra_launch.sh derives PROJECT_ROOT from $PWD
 # name is pinned in rlvr_dolphin.yaml instead of passed here.
 # -----------------------------------------------------------------------------
 export GENRM_MODEL="${GENRM_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansubramania/models/qwen235b_principle_comparison_genrm_step1230}"
+# SC CHANGE: external GenRM is allowed again. akamehra's hard error was about
+# THEIR LB at 10.244.5.76 (job 5733756) — a subnet compute nodes cannot reach.
+# Our own pool's LB (10.109.26.53:9215, login node) was verified reachable from
+# a compute node (HTTP 200 via srun, see experiment/nanov35-run-log.md). The
+# 2-gym-node smoke shape cannot fit in-cluster GenRM (TP4 alone is 4 of 8 gym
+# GPUs, on top of nl2bash TP4 + safety 1), so the smoke uses the external pool;
+# full-scale runs keep akamehra's in-cluster GenRM by leaving GENRM_BASE_URL
+# unset. ultra_launch.sh prefers base_url over model, never passes both; the
+# smoke yaml pins genrm model name "model" (= the pool's --served-model-name).
 if [[ -n "${GENRM_BASE_URL:-}" ]]; then
-  echo "[ERROR] GENRM_BASE_URL is set. GenRM now runs in-cluster; external serving via a" >&2
-  echo "        login-node load balancer is unreachable from compute nodes (job 5733756)." >&2
-  exit 1
+  echo "[GENRM] external mode via ${GENRM_BASE_URL} (in-cluster genrm not launched)"
 fi
 
 # -----------------------------------------------------------------------------
@@ -69,8 +76,10 @@ fi
 # EXP_NAME drives the W&B run name, the singleton job name, and the checkpoint
 # and log dirs — so changing it starts a *new* run rather than resuming.
 # -----------------------------------------------------------------------------
-export EXP_NAME="${EXP_NAME:-akamehra-nano35-honest-dolphin-v10-iter6000-rlvr-async1-tp4_cp4_ep16_pp1_gpp16_pps512_gbs8192}"
-export CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-nano/rlvr_dolphin.yaml}"
+# SC CHANGE: our identity, and the SC-adapted config copy under
+# experiment/change-akash/ instead of akamehra's examples/nemo_gym/ recipe.
+export EXP_NAME="${EXP_NAME:-haitianj-nano35-honest-dolphin-v10-iter6000-rlvr-sc-tp4_cp4_ep16_pp1_gpp16_pps512_gbs8192}"
+export CONFIG_PATH="${CONFIG_PATH:-experiment/change-akash/nemotron-3.5-nano/rlvr_dolphin.yaml}"
 
 # -----------------------------------------------------------------------------
 # Model and data
@@ -142,8 +151,11 @@ export SANDBOX_COMMAND="${SANDBOX_COMMAND-}"
 # lands (get_megatron_checkpoint_dir falls back to $HF_HOME/nemo_rl), so keeping
 # it on Lustre means the conversion is done once, not once per job.
 # -----------------------------------------------------------------------------
-export PERSISTENT_CACHE="${PERSISTENT_CACHE:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/akamehra/.cache/nano35-dolphin}"
-export HF_HOME="${HF_HOME:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/akamehra/hf_home}"
+# SC CHANGE: personalized — akamehra's cache/HF trees are theirs. Reusing the
+# SC campaign's warm cache tree (same model, bf16, same container family) and
+# the HF_HOME where the 62 GB HF->Megatron conversion is already cached.
+export PERSISTENT_CACHE="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/coreai/users/haitianj/nemo_rl_cache/nanov35-sc}"
+export HF_HOME="${HF_HOME:-/lustre/fsw/portfolios/coreai/users/haitianj/hf_cache}"
 
 # -----------------------------------------------------------------------------
 # Container mounts — REQUIRED.
@@ -188,12 +200,10 @@ export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 # Scoped to this one directory rather than mounting the repo root over
 # /opt/nemo-rl, to avoid shadowing anything the image builds in place.
 # -----------------------------------------------------------------------------
-_NEMO_GYM_MOUNT="${REPO_ROOT}/examples/nemo_gym:/opt/nemo-rl/examples/nemo_gym"
-if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
-  export EXTRA_MOUNTS="${EXTRA_MOUNTS},${_NEMO_GYM_MOUNT}"
-else
-  export EXTRA_MOUNTS="${_NEMO_GYM_MOUNT}"
-fi
+# SC CHANGE: the examples/nemo_gym EXTRA_MOUNT is gone — our ultra_launch.sh
+# copy overlays the WHOLE examples/ tree (the image predates the SC entrypoint
+# examples/run_grpo_single_controller.py) plus experiment/, which covers both
+# things this mount existed for.
 
 # -----------------------------------------------------------------------------
 # Snapshotting is OFF because tools/code_snapshot.sh copies only *git-tracked*
@@ -214,7 +224,8 @@ export USE_SNAPSHOT="${USE_SNAPSHOT:-0}"
 # so on a 4 h wall the run would restart from the SFT checkpoint forever.
 # An absolute Lustre path fixes checkpoints, logs, ray_logs and slurm output.
 # -----------------------------------------------------------------------------
-export RESULTS_DIR="${RESULTS_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/akamehra/runs/${EXP_NAME}}"
+# SC CHANGE: personalized results root.
+export RESULTS_DIR="${RESULTS_DIR:-/lustre/fsw/portfolios/coreai/users/haitianj/nanov35-sc/akash-results/${EXP_NAME}}"
 
 # -----------------------------------------------------------------------------
 # SLURM
@@ -237,7 +248,8 @@ export SEGMENT_SIZE="${SEGMENT_SIZE:-2}"
 # it. If it is exported only from ~/.zshrc, submit from zsh; a bash context
 # will not see it.
 # -----------------------------------------------------------------------------
-export WANDB_PROJ="${WANDB_PROJ:-ultra-streaming}"
+# SC CHANGE: this port logs to joc/nanov35-sc.
+export WANDB_PROJ="${WANDB_PROJ:-nanov35-sc}"
 export WANDB_ENTITY="${WANDB_ENTITY:-joc}"
 
 # MTP: head *training* is on via the config (5 repeated layers, loss 0.3,
@@ -263,4 +275,5 @@ echo "  W&B        : ${WANDB_ENTITY}/${WANDB_PROJ}"
 echo "================================================================"
 echo ""
 
-exec bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh "$@"
+# SC CHANGE: delegate to our SC-adapted copy of the ultra launcher.
+exec bash experiment/change-akash/nemotron-3-ultra/ultra_launch.sh "$@"

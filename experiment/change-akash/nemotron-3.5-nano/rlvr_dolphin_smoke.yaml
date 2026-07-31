@@ -1,0 +1,91 @@
+# =============================================================================
+# Nemotron 3.5 Nano — RLVR single-controller SMOKE TEST (akamehra port)
+# =============================================================================
+# Minimal-node shape for validating that the SC adaptation of akamehra's
+# nano35 dolphin recipe runs end to end. NOT a convergence config.
+#
+# Inherits rlvr_dolphin.yaml (the SC-adapted copy of akamehra's config, which
+# itself inherits ../nemotron-3-ultra/student_rlvr1.yaml) and overrides only
+# the small-scale knobs. Launch with experiment/change-akash/launch_smoke.sh.
+#
+# Node shape: 6 nodes total (multiple of SEGMENT_SIZE=2)
+#   Training:   2 nodes (8 GPUs) — TP=4 CP=2 PP=1 => DP=1, EP=4 ETP=1
+#   Generation: 2 nodes (8 GPUs) — vLLM TP=4 EP=1 => 2 instances
+#   Gym:        2 nodes (8 GPUs) — nl2bash TP=4 DP=1 (4 GPUs) + safety (1 GPU);
+#               GenRM is EXTERNAL (2 gym nodes cannot also fit a TP=4 GenRM)
+#
+# Parallelism derivation (values proven by the earlier SC smoke campaign, see
+# experiment/launch_nano_honest_dolphin_smoke.sh and F17 in
+# experiment/nanov35-run-log.md):
+#   world = 2 nodes * 4 GPUs = 8
+#   TP * CP * PP = 4 * 2 * 1 = 8  -> DP = 1
+#   MoE requires EP * ETP == TP * DP = 4 -> EP = 4 (128 experts / 4 = 32/rank)
+# CP=2 splits the 73728-token window across ranks so the trainer fits 2 nodes.
+# Sequence length stays at the production 73728: the blend is built from
+# *_len40k datasets and a shorter window makes vLLM reject real prompts (F15).
+# =============================================================================
+defaults: rlvr_dolphin.yaml
+
+cluster:
+  # Overridden by the launcher (num_nodes = train + generation).
+  num_nodes: 4
+  segment_size: 2
+
+grpo:
+  # PPS * GPP must equal policy.train_global_batch_size (SC-validated).
+  # PPS=16 (not 8): with shuffle=false the run walks the blend head in order,
+  # and rows 1-16 contain 1 genrm_simple_agent row (rows 1-32: 5) — so the
+  # external-GenRM path is actually exercised.
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 4
+  max_num_steps: 10
+
+policy:
+  train_global_batch_size: 64
+
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    context_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 2   # Overridden by the launcher
+
+async_rl:
+  # Scaled from the full run's 2560: num_prompts_per_step *
+  # (max_staleness_versions + 1) = 16 * 5 = 80 groups in-window at once.
+  # min_groups_for_streaming_train / max_inflight_prompts follow
+  # grpo.num_prompts_per_step by interpolation (both 16).
+  max_buffered_rollouts: 80
+  # Per-rollout prompt/completion previews — cheap at this scale, and seeing
+  # what flows through is the point of a smoke run.
+  diagnostics: true
+
+env:
+  nemo_gym:
+    num_gpu_nodes: 2   # Overridden by the launcher
+
+    # nl2bash judge: production runs TP=4 x DP=8 = 32 GPUs. DP=1 brings it to
+    # 4 GPUs so it fits one gym node alongside the 1-GPU safety judge.
+    nl2bash_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          vllm_serve_kwargs:
+            data_parallel_size: 1
+
+    # GenRM — EXTERNAL for the smoke (deep-merged onto the inherited in-cluster
+    # block; base_url set makes LocalVLLMModel skip the local vLLM launch, so
+    # the inherited vllm_serve_* keys are inert). The launcher re-overrides
+    # base_url via GENRM_BASE_URL. `model` must equal the pool's
+    # --served-model-name ("model" in genrm_worker.sh).
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          base_url: http://10.109.26.53:9215/v1
+          model: "model"

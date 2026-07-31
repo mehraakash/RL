@@ -43,7 +43,19 @@ checkpointing:
 grpo:
   # Validation is effectively off in the reference; genrm cohort envs are
   # train-only and would hang under eval.
-  val_period: 10000000
+  # SC CHANGE: was 10000000. The SC path has no validation yet and
+  # setup_single_controller raises when grpo.val_period > 0
+  # (nemo_rl/algorithms/single_controller_utils/setup.py:398). 0 disables it,
+  # which matches the intent here (validation was effectively off anyway).
+  val_period: 0
+  # SC CHANGE: required because loss_fn.reference_policy_kl_penalty is 0.0.
+  # setup_single_controller derives init_reference_model = penalty > 0, so no
+  # reference model is built — but SC still computes reference logprobs unless
+  # this flag is set (single_controller.py reads it), and then dies with
+  # AttributeError: 'MegatronPolicyWorker' has no 'reference_state_dict'
+  # (see F19 in experiment/nanov35-run-log.md). At penalty 0 the reference
+  # logprobs are multiplied by zero anyway, so skipping is simply correct.
+  skip_reference_policy_logprobs_calculation: true
   # REQUIRED by GRPOConfig, and absent from the inherited student_rlvr1.yaml —
   # upstream inconsistency: 83753ed56 (Jul 29-30) added val_start_at as a required
   # field while 64cb9f985 added the ultra recipes without it, so student_rlvr1.yaml
@@ -60,6 +72,20 @@ policy:
 
   # Ultra base is 49152. Reference nano runs 73728.
   max_total_sequence_length: 73728
+
+  # ---------------------------------------------------------------------------
+  # SC CHANGE: speculative-decoding draft head block — required by the SC
+  # entrypoint. examples/run_grpo_single_controller.py:111 reads
+  # config.policy["draft"]["enabled"] unconditionally (the nemo_gym runner
+  # guards it with an `in` check), so omitting this block is a KeyError before
+  # Ray even starts. Disabled — no draft head in this recipe.
+  # ---------------------------------------------------------------------------
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
 
   megatron_cfg:
     tensor_model_parallel_size: 4
@@ -126,6 +152,25 @@ data:
 env:
   nemo_gym:
     num_gpu_nodes: 16
+
+    # -------------------------------------------------------------------------
+    # SC CHANGE: literalize `num_groups_nemo_rl`. The inherited base sets it to
+    # ${add:${grpo.async_grpo.max_trajectory_age_steps}, 1}, but THIS branch's
+    # register_omegaconf_resolvers (nemo_rl/utils/config.py:191) registers only
+    # mul/div/max — no `add` (akamehra's public-main tree has it). Resolution
+    # would die with UnsupportedInterpolationType at config load. 2 is exactly
+    # what akamehra's config resolves to (max_trajectory_age_steps=1, +1).
+    # The key is dead config in the pinned Gym (473f446f) and in nemo_rl —
+    # zero readers — so the literal is safe.
+    # -------------------------------------------------------------------------
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_groups_nemo_rl: 2
+    policy_model_reasoning_off:
+      responses_api_models:
+        vllm_model:
+          num_groups_nemo_rl: 2
 
     # -------------------------------------------------------------------------
     # Env blend. Identical to the base except rdkit_chemistry, which the base
@@ -286,16 +331,73 @@ env:
 
 # -----------------------------------------------------------------------------
 # Logger — log_dir / wandb.name are set by the launcher.
+# SC CHANGE: project ultra-streaming -> nanov35-sc, entity joc (this port's
+# W&B home). `entity` is declared here so a launcher override would have a key
+# to write into (struct-mode overrides need the key to exist — see F16 in
+# experiment/nanov35-run-log.md).
 # -----------------------------------------------------------------------------
 logger:
   wandb_enabled: true
   tensorboard_enabled: true
   monitor_gpus: true
   wandb:
-    project: "ultra-streaming"
+    project: "nanov35-sc"
+    entity: "joc"
 
 # reward_penalties inherited unchanged and already match the reference:
 #   penalize_duplicated_reasoning / empty_final_answer / unwanted_tokens /
 #   malformed_think_tag all true, token_ids {unwanted: [2], think_open: 12,
 #   think_close: 13}. This is the upstreamed form of the internal config's
 #   top-level penalize_* + token_ids block.
+
+# =============================================================================
+# SC CHANGE: Single-Controller (async RL) — required top-level block.
+# MasterConfig (nemo_rl/algorithms/single_controller_utils/config.py:55) lists
+# `async_rl` as a required field, so the SC entrypoint fails validation without
+# it. Values taken from the working SC reference,
+# experiment/configs/grpo_ultra_512n4g_bf16.yaml.
+#
+# Supersedes the legacy `grpo.async_grpo` block above (inherited from
+# student_rlvr1.yaml), which the SC entrypoint never reads. Staleness window is
+# 4 weight versions.
+#
+# `windowed` is the over-sampled streaming sampler: admit() never gates on the
+# trainer version. select() takes any ready group whose start_weight is within
+# [trainer_version - 4, trainer_version]; groups that age out are evicted and
+# their generation cost discarded. Consumed data is genuinely off-policy, which
+# loss_fn.use_importance_sampling_correction: true (inherited) corrects for.
+#
+# max_buffered_rollouts = num_prompts_per_step * (max_staleness_versions + 1)
+# = 512 * 5 = 2560, i.e. exactly the number of groups that can be in-window at
+# once. `windowed` has no validated minimum, so this is the only backpressure
+# on the rollout pump.
+# =============================================================================
+async_rl:
+  sampler:
+    name: windowed
+    max_staleness_versions: 4
+    sample_freshest_first: false
+  recompute_kv_cache_after_weight_updates: false
+  # Must be <= grpo.num_prompts_per_step (validated).
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: 2560
+  diagnostics: false
+
+# =============================================================================
+# SC CHANGE: TransferQueue data plane — mandatory for the SC path.
+# run_grpo_single_controller.py refuses to start unless data_plane.enabled=true,
+# and MasterConfig requires the block. Values from the working SC reference,
+# experiment/configs/grpo_ultra_512n4g_bf16.yaml.
+# =============================================================================
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: "simple"                  # TQ storage backend ('simple' or 'mooncake_cpu')
+  storage_capacity: 1000000          # max samples retained per partition
+  # 2 is the 1B-scale exemplar value. Raise if the TQ storage actors bottleneck
+  # or OOM at 8192 rows/step of up to 73728 tokens.
+  num_storage_units: 2
+  claim_meta_poll_interval_s: 0.5
+  global_segment_size: 549755813888  # 512 GiB — only read when backend == mooncake_cpu
+  local_buffer_size:   68719476736   # 64 GiB  — only read when backend == mooncake_cpu
