@@ -818,6 +818,12 @@ SLURM_DEPENDENCY="${SLURM_DEPENDENCY:-}"
 DEPENDENCY="singleton"
 [[ -n "${SLURM_DEPENDENCY}" ]] && DEPENDENCY="singleton,${SLURM_DEPENDENCY}"
 
+# SC CHANGE: reaper comment is env-overridable. With external GenRM the gym
+# nodes keep legitimately idle GPUs for the whole job, and this cluster's
+# OccupiedIdleGPUsJobReaper kills idle-GPU jobs; launch_full.sh raises the
+# exemption to 240 min. Default preserves akamehra's original comment.
+REAPER_COMMENT="${REAPER_COMMENT:-{\"OccupiedIdleGPUsJobReaper\":{\"exemptIdleTimeMins\":\"60\",\"reason\":\"other\",\"description\":\"batch training run\"}}}"
+
 SBATCH_OUTPUT=$(sbatch \
   --nodes="${NUM_TOTAL_NODES}" \
   --account="${SLURM_ACCOUNT}" \
@@ -834,7 +840,7 @@ SBATCH_OUTPUT=$(sbatch \
   ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
   ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
   ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
-  --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"other","description":"batch training run"}}' \
+  --comment="${REAPER_COMMENT}" \
   "${RAY_SUB}")
 
 echo "${SBATCH_OUTPUT}"
