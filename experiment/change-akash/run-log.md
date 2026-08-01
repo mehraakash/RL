@@ -117,3 +117,67 @@ dependency, cache seeding machinery.
 ---
 
 # ═══ Run log (chronological) ═══
+
+---
+
+## Attempt 1 — job 5749373
+
+Submitted 2026-07-31 16:34 via `experiment/change-akash/launch_smoke.sh`.
+6 nodes (2+2+2), 10 steps, TP4 CP2 EP4, PPS16×GPP4=GBS64, seq 73728, external
+GenRM (pool probed healthy at submit). W&B: joc/nanov35-sc /
+`haitianj-nano35-dolphin-sc-akash-smoke-tp4cp2ep4-pps16gpp4`.
+
+- Slurm logs: `.../akash-results/<exp>/runs/20260731-1634/slurm/`
+- Ray logs: `.../akash-results/<exp>/ray_logs/5749373-logs/`
+
+**Outcome — SUCCESS on the first attempt. Zero runtime failures.**
+
+`sacct`: `COMPLETED 0:0`, elapsed **38:59**. From the driver log:
+
+- pending 16:35 → running 16:38; config loaded, `MasterConfig` validated, all
+  overrides applied cleanly (the `${add:}` literalization held — no
+  `UnsupportedInterpolationType`).
+- Megatron workers reused the cached HF→Megatron conversion from `HF_HOME`
+  ("Checkpoint already exists … Skipping import"), vLLM engines up, all ~70
+  Gym servers up — **including `ether0`**, vindicating "keep akamehra's list"
+  (the old F11–F13 failures do not reproduce with the prebaked-venv container).
+- W&B: https://wandb.ai/joc/nanov35-sc/runs/d8ylx51m
+- `rollout_pump: starting` ~17:00, then the never-before-reached territory:
+
+  ```
+  train step 1/10  trainer_v=1  lag=0
+  ...
+  Saving checkpoint for step 5...
+  train step 5/10  trainer_v=5  lag=4
+  ...
+  Saving checkpoint for step 10...
+  train step 10/10 trainer_v=10 lag=1
+  SC run complete: {'train_steps': 10, 'trainer_version': 10}
+  ```
+
+  All **10 steps** completed (~15 min of training after ~25 min setup), lag
+  values 0–4 show the windowed staleness sampler actually cycling through its
+  window, and weight refit clearly worked across steps.
+- **Checkpoints verified on disk**: `checkpoints/step_5/` and
+  `checkpoints/step_10/`, 368 GB each — `policy/` (model + optimizer),
+  `replay_buffer.pt` (windowed sampler's buffer round-trip),
+  `train_dataloader.pt`, `config.yaml`, `training_info.json`, plus
+  `latest_checkpoint_status.json`.
+- Post-success teardown noise, recorded so nobody chases it: repeated
+  `Error in GPU monitoring collection loop … 'NoneType' object has no
+  attribute 'log'` (the monitor outliving the closed wandb logger), the Gym
+  1-second shutdown-timeout kill of all ~70 servers, and
+  `Error during graceful shutdown … Falling back to force termination` — all
+  AFTER `SC run complete`, exit code still 0.
+
+The one genuine launch-killer of this port (the missing `add` omegaconf
+resolver) was caught by the login-node pre-flight and never cost an
+allocation. Goal met: akamehra's recipe launches and runs successfully on the
+single controller.
+
+**Next (not yet run):** full-scale launch via
+`nemotron-3.5-nano/nano35_dolphin_launch.sh` (16+32+16 nodes, in-cluster
+GenRM, PPS=512, GBS=8192). Before that: re-check the external-GenRM smoke
+assumptions don't leak in (full-scale leaves `GENRM_BASE_URL` unset →
+in-cluster GenRM via `GENRM_MODEL`), and mind that `async_rl.max_buffered_rollouts`
+is already 2560 in `rlvr_dolphin.yaml` for the 512-prompt shape.
