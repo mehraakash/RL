@@ -210,6 +210,38 @@ def test_build_clusters_rejects_non_colocated_megatron_generation():
         sc_setup_mod._build_clusters(master_config)
 
 
+def test_build_clusters_threads_segment_size_to_non_colocated_clusters():
+    """SC preserves the recipe's NVLink segment constraint for both roles."""
+    master_config = _make_master_config(colocated=False, backend="vllm")
+    master_config.cluster = {
+        "num_nodes": 12,
+        "gpus_per_node": 4,
+        "segment_size": 2,
+    }
+    master_config.policy["generation"]["colocated"]["resources"] = {
+        "gpus_per_node": 4,
+        "num_nodes": 4,
+    }
+
+    expected_train_cluster = MagicMock(name="train_cluster")
+    expected_inference_cluster = MagicMock(name="inference_cluster")
+    with patch.object(
+        sc_setup_mod,
+        "RayVirtualCluster",
+        side_effect=[expected_train_cluster, expected_inference_cluster],
+    ) as virtual_cluster:
+        train_cluster, inference_cluster = sc_setup_mod._build_clusters(master_config)
+
+    assert train_cluster is expected_train_cluster
+    assert inference_cluster is expected_inference_cluster
+    assert virtual_cluster.call_count == 2
+    train_call, inference_call = virtual_cluster.call_args_list
+    assert train_call.kwargs["bundle_ct_per_node_list"] == [4] * 8
+    assert inference_call.kwargs["bundle_ct_per_node_list"] == [4] * 4
+    assert train_call.kwargs["segment_size"] == 2
+    assert inference_call.kwargs["segment_size"] == 2
+
+
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 

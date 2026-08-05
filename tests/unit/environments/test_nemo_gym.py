@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import resource
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -29,6 +30,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    _raise_nofile_soft_limit,
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
@@ -40,10 +42,28 @@ from nemo_rl.models.generation.vllm import VllmGeneration
 from tests.unit.models.generation.test_vllm_generation import (
     basic_vllm_test_config,
     cluster,  # noqa: F401
-)
-from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+def test_raise_nofile_soft_limit_to_actor_hard_limit(monkeypatch):
+    setrlimit_calls = []
+    monkeypatch.setattr(
+        resource,
+        "getrlimit",
+        lambda limit: (65_535, 1_048_576),
+    )
+    monkeypatch.setattr(
+        resource,
+        "setrlimit",
+        lambda limit, value: setrlimit_calls.append((limit, value)),
+    )
+
+    _raise_nofile_soft_limit()
+
+    assert setrlimit_calls == [
+        (resource.RLIMIT_NOFILE, (1_048_576, 1_048_576))
+    ]
 
 
 def test_extract_reward_components():

@@ -104,6 +104,7 @@ def _build_clusters(
     backend = generation_config["backend"]
     num_nodes = cluster_config["num_nodes"]
     gpus_per_node = cluster_config["gpus_per_node"]
+    segment_size = cluster_config.get("segment_size")
     port_range_low = cluster_config.get("master_port_range_low")
     port_range_high = cluster_config.get("master_port_range_high")
 
@@ -117,6 +118,7 @@ def _build_clusters(
             max_colocated_worker_groups=1 if backend == "megatron" else 2,
             port_range_low=port_range_low,
             port_range_high=port_range_high,
+            segment_size=segment_size,
         )
         return cluster, cluster
 
@@ -154,6 +156,7 @@ def _build_clusters(
         max_colocated_worker_groups=1,
         port_range_low=port_range_low,
         port_range_high=port_range_high,
+        segment_size=segment_size,
     )
     inference_cluster = RayVirtualCluster(
         name="sc_inference_cluster",
@@ -163,6 +166,7 @@ def _build_clusters(
         max_colocated_worker_groups=1,
         port_range_low=port_range_low,
         port_range_high=port_range_high,
+        segment_size=segment_size,
     )
     return train_cluster, inference_cluster
 

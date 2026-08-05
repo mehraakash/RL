@@ -13,6 +13,7 @@
 # limitations under the License.
 import math
 import os
+import resource
 import subprocess
 import sys
 from collections import Counter
@@ -86,6 +87,22 @@ def get_nemo_gym_venv_dir() -> str | None:
     to /opt).
     """
     return os.environ.get("NEMO_GYM_VENV_DIR")
+
+
+def _raise_nofile_soft_limit() -> None:
+    """Give Gym's child servers all file descriptors allowed to this actor.
+
+    The policy-model proxy exhausted Gym's 65,535-fd soft limit during the
+    full-scale SC campaign at 512 in-flight prompt groups. Child processes
+    inherit this limit, so raise it before Gym starts any servers.
+    """
+    soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit < hard_limit:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard_limit, hard_limit))
+        print(
+            f"NemoGym: raised RLIMIT_NOFILE {soft_limit} -> {hard_limit}",
+            flush=True,
+        )
 
 
 class NemoGymConfig(TypedDict):
@@ -188,6 +205,7 @@ class NemoGym(EnvironmentInterface):
         scheduled onto reserved nodes) and spun up explicitly once the vLLM
         server URLs are available, overlapping with vLLM model loading.
         """
+        _raise_nofile_soft_limit()
         self.node_ip = _get_node_ip_local()
         _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
         _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
