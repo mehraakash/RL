@@ -1,5 +1,5 @@
 # =============================================================================
-# Nemotron 3.5 Nano — RLVR, legacy async-1, honest-dolphin warm start
+# Nemotron 3.5 Nano — RLVR, SingleController in-order/lookahead-1
 # =============================================================================
 # Reproduces the internal reference run
 #   geshen-ultra-rl-nano-honest-dolphin-v10-iter6000-mopd-rlvr
@@ -16,18 +16,18 @@
 # Model: NemotronH hybrid-Mamba MoE, 52 layers, hidden 2688, 128 routed experts
 # top-6 + 1 shared, 32 heads / 2 KV, mamba n_groups=8, MTP 1 layer, vocab 131072.
 #
-# Node budget (GB200, 4 GPU/node), sbatch --nodes=64:
-#   16 train + 32 generation  -> cluster.num_nodes = 48
-#   16 gym                    -> env.nemo_gym.num_gpu_nodes = 16
+# Node budget (GB200, 4 GPU/node), downsized for GBS512:
+#   8 train + 4 generation  -> cluster.num_nodes = 12
+#   4 Gym                   -> env.nemo_gym.num_gpu_nodes = 4
 # =============================================================================
 defaults: ../nemotron-3-ultra/student_rlvr1.yaml
 
 # -----------------------------------------------------------------------------
-# Cluster — ultra was 256 nodes / segment 16; nano uses 48 actor nodes / segment 2
+# Cluster — 12 actor nodes plus 4 Gym nodes; nano uses segment size 2
 # -----------------------------------------------------------------------------
 cluster:
   gpus_per_node: 4
-  num_nodes: 48
+  num_nodes: 12
   segment_size: 2
 
 checkpointing:
@@ -41,6 +41,10 @@ checkpointing:
   save_optimizer: true
 
 grpo:
+  # Match a legacy global batch of 512: 32 prompt groups, each with 16
+  # generations, gives one 512-sample optimizer batch.
+  num_prompts_per_step: 32
+
   # Validation is effectively off in the reference; genrm cohort envs are
   # train-only and would hang under eval.
   # SC CHANGE: was 10000000. The SC path has no validation yet and
@@ -70,6 +74,10 @@ grpo:
 policy:
   model_name: /lustre/fsw/portfolios/llmservice/users/venkats/training_actual_0603/nano_n3_post/checkpoints/nano-3.5-sft-v10-closethink-unmask-orig6k-from-midtrain-100B-lc-lr2e-5/eval/iter_0006000/hf
 
+  # Must equal grpo.num_prompts_per_step * num_generations_per_prompt:
+  # 32 * 16 = 512.
+  train_global_batch_size: 512
+
   # Ultra base is 49152. Reference nano runs 73728.
   max_total_sequence_length: 73728
 
@@ -90,8 +98,9 @@ policy:
   megatron_cfg:
     tensor_model_parallel_size: 4
     expert_tensor_parallel_size: 1
-    # 128 routed experts / EP16 = 8 experts per rank
-    expert_model_parallel_size: 16
+    # 32 training GPUs / (TP4 * CP4) = DP2. EP8 keeps
+    # EP * ETP == TP * DP and assigns 16 routed experts per EP rank.
+    expert_model_parallel_size: 8
     pipeline_model_parallel_size: 1
     context_parallel_size: 4
     moe_token_dispatcher_type: "alltoall"
@@ -136,7 +145,7 @@ policy:
       enabled: false
       resources:
         gpus_per_node: 4
-        num_nodes: 32
+        num_nodes: 4
 
 # -----------------------------------------------------------------------------
 # Data — the launcher overrides these; defaults point at the reference blend.
@@ -151,7 +160,7 @@ data:
 
 env:
   nemo_gym:
-    num_gpu_nodes: 16
+    num_gpu_nodes: 4
 
     # -------------------------------------------------------------------------
     # SC CHANGE: literalize `num_groups_nemo_rl`. The inherited base sets it to
@@ -304,17 +313,23 @@ env:
           group_reasoning_length_penalty_coeff: 0.12
           group_answer_length_penalty_coeff: 0.12
 
-    # Qwen3-235B-A22B-Instruct-2507-FP8. TP4 x DP8 = 32 GPUs = 8 of the 16 gym
-    # nodes. Base ships DP4 (sized for 256n ultra); reference uses DP8.
+    # Qwen3-235B-A22B-Instruct-2507-FP8. TP4 x DP3 = 12 GPUs on three of the
+    # four Gym nodes, leaving room for the 1-GPU safety judge and CPU services.
     # Backs equivalence_llm_judge, lc_judge, math_with_judge, multichallenge,
     # inverse_if and abstention — so this sizing gates six families.
     nl2bash_judge_model:
       responses_api_models:
         local_vllm_model:
           model: /lustre/fsw/portfolios/llmservice/users/ansubramania/models/Qwen3-235B-A22B-Instruct-2507-FP8
+          vllm_serve_env_vars:
+            # Confirmed on the legacy control: avoid MNNVL collective setup and
+            # give Ray's compiled DAG the same long wait as vLLM.
+            NCCL_MNNVL_ENABLE: "0"
+            RAY_CGRAPH_get_timeout: "2400"
           vllm_serve_kwargs:
             tensor_parallel_size: 4
-            data_parallel_size: 8
+            data_parallel_size: 3
+            distributed_timeout_seconds: 2400
             # Back to 112 (upstream default); see genrm note above.
             model_loader_extra_config:
               enable_multithread_load: true
@@ -331,8 +346,7 @@ env:
 
 # -----------------------------------------------------------------------------
 # Logger — log_dir / wandb.name are set by the launcher.
-# SC CHANGE: project ultra-streaming -> nanov35-sc, entity joc (this port's
-# W&B home). `entity` is declared here so a launcher override would have a key
+# SC CHANGE: entity is declared here so a launcher override has a key
 # to write into (struct-mode overrides need the key to exist — see F16 in
 # experiment/nanov35-run-log.md).
 # -----------------------------------------------------------------------------
@@ -341,7 +355,7 @@ logger:
   tensorboard_enabled: true
   monitor_gpus: true
   wandb:
-    project: "nanov35-sc"
+    project: "ultra-streaming"
     entity: "joc"
 
 # reward_penalties inherited unchanged and already match the reference:
@@ -357,31 +371,26 @@ logger:
 # it. Values taken from the working SC reference,
 # experiment/configs/grpo_ultra_512n4g_bf16.yaml.
 #
-# Supersedes the legacy `grpo.async_grpo` block above (inherited from
-# student_rlvr1.yaml), which the SC entrypoint never reads. Staleness window is
-# 4 weight versions.
+# Supersedes the inherited legacy `grpo.async_grpo` block, which the SC
+# entrypoint never reads. `in_order` stamps each dispatched cohort with its
+# exact target optimizer step. lookahead=1 admits one live cohort and one future
+# cohort, reproducing legacy max_trajectory_age_steps=1 without over-sampling.
 #
-# `windowed` is the over-sampled streaming sampler: admit() never gates on the
-# trainer version. select() takes any ready group whose start_weight is within
-# [trainer_version - 4, trainer_version]; groups that age out are evicted and
-# their generation cost discarded. Consumed data is genuinely off-policy, which
-# loss_fn.use_importance_sampling_correction: true (inherited) corrects for.
-#
-# max_buffered_rollouts = num_prompts_per_step * (max_staleness_versions + 1)
-# = 512 * 5 = 2560, i.e. exactly the number of groups that can be in-window at
-# once. `windowed` has no validated minimum, so this is the only backpressure
-# on the rollout pump.
+# Units matter: these values count prompt groups, not individual generations.
+# One optimizer cohort is 512 / 16 = 32 groups. Current + one lookahead is
+# 2 * 32 = 64 groups (1024 individual generations).
 # =============================================================================
 async_rl:
   sampler:
-    name: windowed
-    max_staleness_versions: 4
-    sample_freshest_first: false
+    name: in_order
+    max_lookahead_versions: 1
   recompute_kv_cache_after_weight_updates: false
-  # Must be <= grpo.num_prompts_per_step (validated).
+  # Trainer consumes one 32-group cohort at a time.
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
-  max_inflight_prompts: ${grpo.num_prompts_per_step}
-  max_buffered_rollouts: 2560
+  # Permit both the current and lookahead cohorts to generate concurrently.
+  max_inflight_prompts: 64
+  # Gated in-order sampling requires PPS * (lookahead + 1) slots.
+  max_buffered_rollouts: 64
   diagnostics: false
 
 # =============================================================================
@@ -396,7 +405,7 @@ data_plane:
   backend: "simple"                  # TQ storage backend ('simple' or 'mooncake_cpu')
   storage_capacity: 1000000          # max samples retained per partition
   # 2 is the 1B-scale exemplar value. Raise if the TQ storage actors bottleneck
-  # or OOM at 8192 rows/step of up to 73728 tokens.
+  # or OOM at 512 rows/step of up to 73728 tokens.
   num_storage_units: 2
   claim_meta_poll_interval_s: 0.5
   global_segment_size: 549755813888  # 512 GiB — only read when backend == mooncake_cpu

@@ -58,11 +58,10 @@ policy:
         num_nodes: 2   # Overridden by the launcher
 
 async_rl:
-  # Scaled from the full run's 2560: num_prompts_per_step *
-  # (max_staleness_versions + 1) = 16 * 5 = 80 groups in-window at once.
-  # min_groups_for_streaming_train / max_inflight_prompts follow
-  # grpo.num_prompts_per_step by interpolation (both 16).
-  max_buffered_rollouts: 80
+  # In-order/lookahead-1 needs two 16-group cohorts. Override the production
+  # literal so the smoke preserves the same scheduling semantics at small scale.
+  max_inflight_prompts: 32
+  max_buffered_rollouts: 32
   # Per-rollout prompt/completion previews — cheap at this scale, and seeing
   # what flows through is the point of a smoke run.
   diagnostics: true
@@ -87,5 +86,5 @@ env:
     genrm_model:
       responses_api_models:
         genrm_model:
-          base_url: http://10.109.26.53:9215/v1
+          base_url: null
           model: "model"

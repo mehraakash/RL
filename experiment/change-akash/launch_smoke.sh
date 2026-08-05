@@ -28,12 +28,13 @@ export SEGMENT_SIZE="${SEGMENT_SIZE:-2}"
 export NRL_MAX_STEPS="${NRL_MAX_STEPS:-10}"
 
 # --- Identity: separate checkpoint/W&B/results tree from the full-scale run --
-export EXP_NAME="${EXP_NAME:-haitianj-nano35-dolphin-sc-akash-smoke-tp4cp2ep4-pps16gpp4}"
+export EXP_NAME="${EXP_NAME:-akamehra-nano35-sc-inorder1-smoke-tp4cp2ep4-pps16gpp4}"
 export CONFIG_PATH="${CONFIG_PATH:-experiment/change-akash/nemotron-3.5-nano/rlvr_dolphin_smoke.yaml}"
 
 # --- External GenRM (our own pool; LB on a login node, verified reachable ----
 # --- from compute nodes). Probe it before spending a 6-node allocation. ------
-export GENRM_BASE_URL="${GENRM_BASE_URL:-http://10.109.26.53:9215/v1}"
+: "${GENRM_BASE_URL:?GENRM_BASE_URL must point to the external GenRM /v1 endpoint}"
+export GENRM_BASE_URL
 _genrm_health="${GENRM_BASE_URL%/v1}/health"
 if ! curl -sf --max-time 10 "${_genrm_health}" >/dev/null; then
   echo "[ERROR] GenRM LB not healthy at ${_genrm_health}." >&2
@@ -43,7 +44,7 @@ fi
 echo "[GENRM] healthy: ${_genrm_health}"
 
 echo "=============================================================="
-echo "  SC SMOKE (akamehra port) — wiring validation, not convergence"
+echo "  SC IN-ORDER / LOOKAHEAD-1 SMOKE — wiring validation"
 echo "  Nodes: ${NUM_TRAIN_NODES} train + ${NUM_GEN_NODES} gen + ${NUM_GYM_NODES} gym"
 echo "  Steps: ${NRL_MAX_STEPS}   Config: ${CONFIG_PATH}"
 echo "=============================================================="

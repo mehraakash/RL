@@ -1,10 +1,8 @@
 # =============================================================================
 # Nemotron 3.5 Nano — RLVR single-controller, FULL SCALE, EXTERNAL GenRM
 # =============================================================================
-# Identical to the SC-adapted rlvr_dolphin.yaml except GenRM is served by our
-# own external pool instead of in-cluster. The pool has 10 TP=8 replicas
-# behind one LB (group haitianj-nanov35), which matches the reference sizing
-# for this blend (13.3% of rows are GenRM-routed).
+# Identical to rlvr_dolphin.yaml except GenRM is served by the external pool
+# used by the legacy control. The launcher supplies the allocation-specific URL.
 #
 # Deep-merged onto the inherited in-cluster genrm_model block: setting
 # base_url makes Gym's LocalVLLMModel skip the local vLLM launch entirely, so
@@ -12,9 +10,8 @@
 # --served-model-name ("model" in genrm_worker.sh). The launcher re-overrides
 # base_url via GENRM_BASE_URL at submit time.
 #
-# Node budget consequence (see launch_full.sh): akamehra's 16 gym nodes
-# included 4 for in-cluster GenRM (TP4 x DP4); externally those are not
-# needed, so the full run uses 12 gym nodes with identical judge capacity.
+# The GBS512 training allocation uses 16 nodes: 8 train, 4 policy-generation,
+# and 4 Gym nodes. GenRM service nodes are separate.
 # =============================================================================
 defaults: rlvr_dolphin.yaml
 
@@ -23,5 +20,5 @@ env:
     genrm_model:
       responses_api_models:
         genrm_model:
-          base_url: http://10.109.26.53:9215/v1
+          base_url: null
           model: "model"

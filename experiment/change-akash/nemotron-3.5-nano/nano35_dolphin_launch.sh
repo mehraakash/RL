@@ -32,44 +32,28 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "${REPO_ROOT}"   # ultra_launch.sh derives PROJECT_ROOT from $PWD
 
 # -----------------------------------------------------------------------------
-# GenRM — EXTERNAL, and hard-required.
+# GenRM — EXTERNAL, and hard-required, matching the latest legacy control.
 #
 # We serve GenRM out-of-band rather than in-cluster because partition `batch`
 # caps at 4 h: an in-cluster pool would reload the 470 GB bf16 Qwen3-235B on
 # every restart, whereas an external pool stays warm across all of them.
 #
-# Stand it up first (copy the dir — it holds .lb_pid_*, logs/ and a flock'd
-# registry, so running geshen's in place would collide with their pool):
+# Stand it up first with the tracked helper after exporting the site-private
+# service, model, and scheduler values from the internal runbook:
 #
-#   cp -r /lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/\
-# users/geshen/mopd_nano_fast/genrm_serving  <your-dir>/genrm_serving
-#   cd <your-dir>/genrm_serving
-#   MODEL=/lustre/fsw/portfolios/llmservice/users/ansubramania/models/qwen235b_principle_comparison_genrm_step1230 \
-#   ACCOUNT=nemotron_sw_post PARTITION=batch_long TIME=1-12:00:00 \
-#   LB_PORT=9213 GENRM_GROUP_ID=nano35_dolphin \
-#     ./genrm_server_manager.sh launch N
-#   ./genrm_server_manager.sh url
+#   bash experiment/change-akash/nemotron-3.5-nano/serve_genrm.sh 1
+#   export GENRM_BASE_URL="$(bash \
+#     experiment/change-akash/nemotron-3.5-nano/serve_genrm.sh --wait 60)"
 #
-# NOTE: that script's default MODEL is the *ultra* GenRM (step_720) — override it.
-# Each worker is 2 nodes x 4 GPUs at TP=8, separate from this job's 64 nodes.
+# Each worker is 2 nodes x 4 GPUs at TP=8, separate from this job's 16 nodes.
 #
 # The `model` field must equal the pool's --served-model-name ("model" in
 # genrm_worker.sh). ultra_launch.sh sets base_url XOR model, never both, so the
 # name is pinned in rlvr_dolphin.yaml instead of passed here.
 # -----------------------------------------------------------------------------
-export GENRM_MODEL="${GENRM_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansubramania/models/qwen235b_principle_comparison_genrm_step1230}"
-# SC CHANGE: external GenRM is allowed again. akamehra's hard error was about
-# THEIR LB at 10.244.5.76 (job 5733756) — a subnet compute nodes cannot reach.
-# Our own pool's LB (10.109.26.53:9215, login node) was verified reachable from
-# a compute node (HTTP 200 via srun, see experiment/nanov35-run-log.md). The
-# 2-gym-node smoke shape cannot fit in-cluster GenRM (TP4 alone is 4 of 8 gym
-# GPUs, on top of nl2bash TP4 + safety 1), so the smoke uses the external pool;
-# full-scale runs keep akamehra's in-cluster GenRM by leaving GENRM_BASE_URL
-# unset. ultra_launch.sh prefers base_url over model, never passes both; the
-# smoke yaml pins genrm model name "model" (= the pool's --served-model-name).
-if [[ -n "${GENRM_BASE_URL:-}" ]]; then
-  echo "[GENRM] external mode via ${GENRM_BASE_URL} (in-cluster genrm not launched)"
-fi
+: "${GENRM_BASE_URL:?GENRM_BASE_URL must point to the external GenRM /v1 endpoint}"
+export GENRM_BASE_URL
+unset GENRM_MODEL
 
 # -----------------------------------------------------------------------------
 # Experiment identity
@@ -78,8 +62,8 @@ fi
 # -----------------------------------------------------------------------------
 # SC CHANGE: our identity, and the SC-adapted config copy under
 # experiment/change-akash/ instead of akamehra's examples/nemo_gym/ recipe.
-export EXP_NAME="${EXP_NAME:-haitianj-nano35-honest-dolphin-v10-iter6000-rlvr-sc-tp4_cp4_ep16_pp1_gpp16_pps512_gbs8192}"
-export CONFIG_PATH="${CONFIG_PATH:-experiment/change-akash/nemotron-3.5-nano/rlvr_dolphin.yaml}"
+export EXP_NAME="${EXP_NAME:-akamehra-nano35-honest-dolphin-v10-iter6000-rlvr-sc-inorder1-n16-tp4_cp4_ep8_pp1_gpp16_pps32_gbs512}"
+export CONFIG_PATH="${CONFIG_PATH:-experiment/change-akash/nemotron-3.5-nano/rlvr_dolphin_extgenrm.yaml}"
 
 # -----------------------------------------------------------------------------
 # Model and data
@@ -118,7 +102,8 @@ export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-/lustre/fsw/portfolios/llmservice
 # `--kill-on-bad-exit=1` (ray.sub:967), unlike the Ray worker step which uses
 # `--kill-on-bad-exit=0` (ray.sub:1016). So a single node failing during sandbox
 # startup makes srun tear down all 64 sandbox tasks; ray.sub then sees its
-# background sandbox srun die and exits. At 64 nodes that happened on 3 of 3
+# background sandbox srun die and exits. At the earlier 64-node shape that
+# happened on 3 of 3
 # attempts, on different nodes each time (nvl72133-T01, nvl72141-T07,
 # nvl72126-T05/T17) — node exclusion cannot fix it.
 #
@@ -135,7 +120,7 @@ export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-/lustre/fsw/portfolios/llmservice
 # and the srun itself. An empty SANDBOX_COMMAND skips all three. Requires the
 # ultra_launch.sh `${SANDBOX_COMMAND-...}` patch, since `:-` would override "".
 #
-# Side benefit: no 16 GB sandbox image extracted on 64 nodes, so faster startup.
+# Side benefit: no 16 GB sandbox image is extracted on every allocated node.
 # To re-enable (e.g. if a future blend uses Lean4), unset this.
 # -----------------------------------------------------------------------------
 export SANDBOX_COMMAND="${SANDBOX_COMMAND-}"
@@ -154,8 +139,8 @@ export SANDBOX_COMMAND="${SANDBOX_COMMAND-}"
 # SC CHANGE: personalized — akamehra's cache/HF trees are theirs. Reusing the
 # SC campaign's warm cache tree (same model, bf16, same container family) and
 # the HF_HOME where the 62 GB HF->Megatron conversion is already cached.
-export PERSISTENT_CACHE="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/coreai/users/haitianj/nemo_rl_cache/nanov35-sc}"
-export HF_HOME="${HF_HOME:-/lustre/fsw/portfolios/coreai/users/haitianj/hf_cache}"
+export PERSISTENT_CACHE="${PERSISTENT_CACHE:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/akamehra/.cache/nano35-dolphin}"
+export HF_HOME="${HF_HOME:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/akamehra/hf_home}"
 
 # -----------------------------------------------------------------------------
 # Container mounts — REQUIRED.
@@ -212,7 +197,9 @@ export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 # not contain the config. To restore frozen provenance, `git add` the recipe and
 # set USE_SNAPSHOT=1.
 # -----------------------------------------------------------------------------
-export USE_SNAPSHOT="${USE_SNAPSHOT:-0}"
+# The recipe is tracked in this worktree, so freeze every submission. This
+# avoids the node-local Lustre import flakes seen in the SC campaign.
+export USE_SNAPSHOT="${USE_SNAPSHOT:-1}"
 
 # -----------------------------------------------------------------------------
 # Results root — MUST be absolute.
@@ -225,11 +212,11 @@ export USE_SNAPSHOT="${USE_SNAPSHOT:-0}"
 # An absolute Lustre path fixes checkpoints, logs, ray_logs and slurm output.
 # -----------------------------------------------------------------------------
 # SC CHANGE: personalized results root.
-export RESULTS_DIR="${RESULTS_DIR:-/lustre/fsw/portfolios/coreai/users/haitianj/nanov35-sc/akash-results/${EXP_NAME}}"
+export RESULTS_DIR="${RESULTS_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/akamehra/runs/${EXP_NAME}}"
 
 # -----------------------------------------------------------------------------
 # SLURM
-# Job shape matches the reference: 16 train + 32 gen + 16 gym = 64 GB200 nodes
+# GBS512 downsized shape: 8 train + 4 generation + 4 Gym = 16 GB200 nodes
 # (4 GPUs each). SEGMENT_SIZE=2 is the nano value; ultra defaults to 16.
 # Partition `batch` caps at 4 h (batch_long is 7 d), so WALLTIME is 4 h and
 # CHECKPOINTING_SAVE_BY keeps the reference's 25-minute teardown margin.
@@ -238,10 +225,16 @@ export SLURM_ACCOUNT="${SLURM_ACCOUNT:-nemotron_sw_post}"
 export SLURM_PARTITION="${SLURM_PARTITION:-batch}"
 export WALLTIME="${WALLTIME:-4:00:00}"
 export CHECKPOINTING_SAVE_BY="${CHECKPOINTING_SAVE_BY:-00:03:35:00}"
-export NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-16}"
-export NUM_GEN_NODES="${NUM_GEN_NODES:-32}"
-export NUM_GYM_NODES="${NUM_GYM_NODES:-16}"
+export NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-8}"
+export NUM_GEN_NODES="${NUM_GEN_NODES:-4}"
+export NUM_GYM_NODES="${NUM_GYM_NODES:-4}"
 export SEGMENT_SIZE="${SEGMENT_SIZE:-2}"
+
+# Same accepted scheduler exemption used by the legacy control. launch_full.sh
+# may override this whole JSON object.
+if [[ -z "${REAPER_COMMENT:-}" ]]; then
+  export REAPER_COMMENT='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"data_loading","description":"nano35 SC rollout warmup and judge loading"}}'
+fi
 
 # -----------------------------------------------------------------------------
 # W&B. WANDB_API_KEY must already be in the environment — ultra_launch.sh needs
@@ -249,7 +242,7 @@ export SEGMENT_SIZE="${SEGMENT_SIZE:-2}"
 # will not see it.
 # -----------------------------------------------------------------------------
 # SC CHANGE: this port logs to joc/nanov35-sc.
-export WANDB_PROJ="${WANDB_PROJ:-nanov35-sc}"
+export WANDB_PROJ="${WANDB_PROJ:-ultra-streaming}"
 export WANDB_ENTITY="${WANDB_ENTITY:-joc}"
 
 # MTP: head *training* is on via the config (5 repeated layers, loss 0.3,
@@ -267,8 +260,7 @@ echo "  Blend      : ${TRAIN_PATH}"
 echo "  Container  : ${CONTAINER}"
 echo "  Cache      : ${PERSISTENT_CACHE}"
 echo "  HF_HOME    : ${HF_HOME}"
-echo "  GenRM      : ${GENRM_MODEL}"
-echo "               (in-cluster, TP4 x DP4 = 4 of ${NUM_GYM_NODES} gym nodes)"
+echo "  GenRM      : ${GENRM_BASE_URL} (external; served model name: model)"
 echo "  SLURM      : ${SLURM_ACCOUNT} / ${SLURM_PARTITION} / ${WALLTIME}"
 echo "  Nodes      : ${NUM_TRAIN_NODES} train + ${NUM_GEN_NODES} gen + ${NUM_GYM_NODES} gym"
 echo "  W&B        : ${WANDB_ENTITY}/${WANDB_PROJ}"

@@ -818,11 +818,12 @@ SLURM_DEPENDENCY="${SLURM_DEPENDENCY:-}"
 DEPENDENCY="singleton"
 [[ -n "${SLURM_DEPENDENCY}" ]] && DEPENDENCY="singleton,${SLURM_DEPENDENCY}"
 
-# SC CHANGE: reaper comment is env-overridable. With external GenRM the gym
-# nodes keep legitimately idle GPUs for the whole job, and this cluster's
-# OccupiedIdleGPUsJobReaper kills idle-GPU jobs; launch_full.sh raises the
-# exemption to 240 min. Default preserves akamehra's original comment.
-REAPER_COMMENT="${REAPER_COMMENT:-{\"OccupiedIdleGPUsJobReaper\":{\"exemptIdleTimeMins\":\"60\",\"reason\":\"other\",\"description\":\"batch training run\"}}}"
+# SC CHANGE: reaper comment is env-overridable. Avoid parameter-expansion
+# defaults containing JSON braces: Bash terminates the expansion at an inner
+# brace and appends the remaining braces to the value.
+if [[ -z "${REAPER_COMMENT:-}" ]]; then
+  REAPER_COMMENT='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"other","description":"batch training run"}}'
+fi
 
 SBATCH_OUTPUT=$(sbatch \
   --nodes="${NUM_TOTAL_NODES}" \
