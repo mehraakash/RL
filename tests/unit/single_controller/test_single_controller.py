@@ -15,11 +15,13 @@
 """Tests for SingleController initialization and pump lifecycle."""
 
 import asyncio
+import math
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.single_controller import SingleControllerActor
@@ -35,6 +37,95 @@ from nemo_rl.utils.timer import Timer
 
 class FakeWeightSynchronizer:
     pass
+
+
+class _InMemoryDataPlane:
+    def __init__(self, data: TensorDict) -> None:
+        self.data = data
+        self.last_write: TensorDict | None = None
+
+    def get_samples(self, *, select_fields: list[str], **kwargs) -> TensorDict:
+        del kwargs
+        return TensorDict(
+            {field: self.data[field] for field in select_fields},
+            batch_size=self.data.batch_size,
+        )
+
+    def put_samples(self, *, fields: TensorDict, **kwargs) -> None:
+        del kwargs
+        self.last_write = fields
+        for field in fields.keys():
+            self.data[field] = fields[field]
+
+
+class _RewardAdvantageEstimator:
+    def compute_advantage(
+        self,
+        *,
+        rewards: torch.Tensor,
+        mask: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        del kwargs
+        return rewards.unsqueeze(-1).expand_as(mask).clone()
+
+
+def test_advantage_stage_applies_seq_logprob_error_mask_before_training() -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._master_config = SimpleNamespace(
+        grpo={"seq_logprob_error_threshold": 2.0}
+    )
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._policy_logprobs_required = True
+    ctrl._reference_logprobs_required = False
+    ctrl._advantage_estimator = _RewardAdvantageEstimator()
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_chunks": [],
+    }
+
+    # The first response matches pi_old. The second differs by 3x at every
+    # response token, so threshold=2 must zero its full-sequence sample_mask.
+    data = TensorDict(
+        {
+            "token_mask": torch.tensor([[0, 1, 1], [0, 1, 1]]).float(),
+            "sample_mask": torch.ones(2),
+            "prev_logprobs": torch.tensor(
+                [
+                    [100.0, 0.0, 0.0],
+                    [0.0, math.log(3.0), math.log(3.0)],
+                ]
+            ),
+            "generation_logprobs": torch.zeros(2, 3),
+            "prompt_ids_for_adv": torch.zeros(2, dtype=torch.long),
+            "total_reward": torch.tensor([1.0, 0.0]),
+        },
+        batch_size=[2],
+    )
+    ctrl._dp_client = _InMemoryDataPlane(data)
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["s0", "s1"],
+        fields=list(data.keys()),
+        sequence_lengths=[3, 3],
+        tags=[{"weight_version": 0}, {"weight_version": 0}],
+    )
+
+    out_meta = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert ctrl._dp_client.last_write is not None
+    assert torch.equal(
+        ctrl._dp_client.last_write["sample_mask"], torch.tensor([1.0, 0.0])
+    )
+    assert "advantages" in out_meta.fields
+    assert ctrl._step_log_dict["seq_logprob_error_chunks"][0][
+        "num_masked_seqs"
+    ] == 1
+    assert ctrl._step_log_dict["masked_advantages"][0].numel() == 2
 
 
 def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:

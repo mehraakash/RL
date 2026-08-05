@@ -123,6 +123,65 @@ def reduce_advantage_pump_metrics(
     return out
 
 
+def reduce_seq_logprob_error_pump_metrics(
+    chunks: list[dict[str, float]],
+) -> dict[str, float]:
+    """Combine legacy sequence-logprob metrics from streamed SC chunks.
+
+    Chunk means are weighted by the number of valid sequences rather than by
+    the number of chunks. Min/max reductions ignore chunks with no valid
+    sequences, and masked accuracy is weighted by the number masked.
+    """
+    if not chunks:
+        return {}
+
+    before = [c for c in chunks if c["_num_valid_seqs_before_mask"] > 0]
+    after = [c for c in chunks if c["_num_valid_seqs_after_mask"] > 0]
+
+    def _weighted_mean(
+        items: list[dict[str, float]], key: str, count_key: str
+    ) -> float:
+        total = sum(c[count_key] for c in items)
+        if total == 0:
+            return 0.0
+        return float(sum(c[key] * c[count_key] for c in items) / total)
+
+    total_masked = sum(c["num_masked_seqs"] for c in chunks)
+    masked_correct_pct = (
+        sum(c["masked_correct_pct"] * c["num_masked_seqs"] for c in chunks)
+        / total_masked
+        if total_masked > 0
+        else 0.0
+    )
+
+    return {
+        "max_seq_mult_prob_error": max(
+            (c["max_seq_mult_prob_error"] for c in before), default=0.0
+        ),
+        "mean_seq_mult_prob_error": _weighted_mean(
+            before,
+            "mean_seq_mult_prob_error",
+            "_num_valid_seqs_before_mask",
+        ),
+        "min_seq_mult_prob_error": min(
+            (c["min_seq_mult_prob_error"] for c in before), default=0.0
+        ),
+        "max_seq_mult_prob_error_after_mask": max(
+            (c["max_seq_mult_prob_error_after_mask"] for c in after), default=0.0
+        ),
+        "mean_seq_mult_prob_error_after_mask": _weighted_mean(
+            after,
+            "mean_seq_mult_prob_error_after_mask",
+            "_num_valid_seqs_after_mask",
+        ),
+        "min_seq_mult_prob_error_after_mask": min(
+            (c["min_seq_mult_prob_error_after_mask"] for c in after), default=0.0
+        ),
+        "num_masked_seqs_by_logprob_error": float(total_masked),
+        "masked_correct_pct": float(masked_correct_pct),
+    }
+
+
 def tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:
     """Read a tensor column from a TensorDict, depadding if nested.
 

@@ -26,6 +26,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     fields_for_put,
     reduce_advantage_pump_metrics,
+    reduce_seq_logprob_error_pump_metrics,
     squeeze_trailing_unit_dim,
     tensor_field,
 )
@@ -159,6 +160,50 @@ class TestReduceAdvantagePumpMetrics:
 
     def test_all_empty_inputs_returns_empty_dict(self) -> None:
         assert reduce_advantage_pump_metrics([], [], []) == {}
+
+
+class TestReduceSeqLogprobErrorPumpMetrics:
+    def test_weights_chunk_means_and_masked_accuracy_by_sequence_count(self) -> None:
+        out = reduce_seq_logprob_error_pump_metrics(
+            [
+                {
+                    "max_seq_mult_prob_error": 2.0,
+                    "mean_seq_mult_prob_error": 1.5,
+                    "min_seq_mult_prob_error": 1.0,
+                    "max_seq_mult_prob_error_after_mask": 1.0,
+                    "mean_seq_mult_prob_error_after_mask": 1.0,
+                    "min_seq_mult_prob_error_after_mask": 1.0,
+                    "num_masked_seqs": 1.0,
+                    "masked_correct_pct": 1.0,
+                    "_num_valid_seqs_before_mask": 2.0,
+                    "_num_valid_seqs_after_mask": 1.0,
+                },
+                {
+                    "max_seq_mult_prob_error": 3.0,
+                    "mean_seq_mult_prob_error": 2.0,
+                    "min_seq_mult_prob_error": 1.0,
+                    "max_seq_mult_prob_error_after_mask": 2.0,
+                    "mean_seq_mult_prob_error_after_mask": 1.5,
+                    "min_seq_mult_prob_error_after_mask": 1.0,
+                    "num_masked_seqs": 1.0,
+                    "masked_correct_pct": 0.0,
+                    "_num_valid_seqs_before_mask": 3.0,
+                    "_num_valid_seqs_after_mask": 2.0,
+                },
+            ]
+        )
+
+        assert out["max_seq_mult_prob_error"] == pytest.approx(3.0)
+        assert out["mean_seq_mult_prob_error"] == pytest.approx(1.8)
+        assert out["min_seq_mult_prob_error"] == pytest.approx(1.0)
+        assert out["max_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
+        assert out["mean_seq_mult_prob_error_after_mask"] == pytest.approx(4.0 / 3.0)
+        assert out["min_seq_mult_prob_error_after_mask"] == pytest.approx(1.0)
+        assert out["num_masked_seqs_by_logprob_error"] == pytest.approx(2.0)
+        assert out["masked_correct_pct"] == pytest.approx(0.5)
+
+    def test_empty_chunks_returns_empty_dict(self) -> None:
+        assert reduce_seq_logprob_error_pump_metrics([]) == {}
 
 
 class TestFieldsForPut:

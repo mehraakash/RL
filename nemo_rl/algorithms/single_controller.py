@@ -46,7 +46,11 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
-from nemo_rl.algorithms.grpo import GRPOSaveState, _write_latest_checkpoint_status
+from nemo_rl.algorithms.grpo import (
+    GRPOSaveState,
+    _write_latest_checkpoint_status,
+    compute_and_apply_seq_logprob_error_masking,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
@@ -58,6 +62,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     fields_for_put,
     reduce_advantage_pump_metrics,
+    reduce_seq_logprob_error_pump_metrics,
     squeeze_trailing_unit_dim,
     tensor_field,
 )
@@ -198,6 +203,7 @@ class SingleControllerActor:
             "rewards": [],
             "masked_advantages": [],
             "sequence_lengths": [],
+            "seq_logprob_error_chunks": [],
         }
 
         print(
@@ -590,7 +596,16 @@ class SingleControllerActor:
 
                 step_metrics = aggregate_step_metrics(result)
                 step_metrics.update(
-                    reduce_advantage_pump_metrics(**self._step_log_dict)
+                    reduce_advantage_pump_metrics(
+                        rewards=self._step_log_dict["rewards"],
+                        masked_advantages=self._step_log_dict["masked_advantages"],
+                        sequence_lengths=self._step_log_dict["sequence_lengths"],
+                    )
+                )
+                step_metrics.update(
+                    reduce_seq_logprob_error_pump_metrics(
+                        self._step_log_dict["seq_logprob_error_chunks"]
+                    )
                 )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
 
@@ -654,7 +669,7 @@ class SingleControllerActor:
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
             # TODO: per-step train_data jsonl dump, vllm metrics logger,
-            #   histogram log, rollout_metrics, seq_logprob_error_metrics,
+            #   histogram log, rollout_metrics,
             #   pretty-print "Training Results" block, print_performance_metrics.
             print(f"step_metrics={step_metrics}", flush=True)
             self._logger.log_metrics(
@@ -852,6 +867,45 @@ class SingleControllerActor:
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
+
+        fields_to_write: dict[str, torch.Tensor] = {}
+        seq_logprob_error_threshold = self._master_config.grpo.get(
+            "seq_logprob_error_threshold"
+        )
+        if seq_logprob_error_threshold is not None:
+            # Match the legacy path: compare generation-engine logprobs against
+            # the pre-update trainer policy and zero sample_mask for an entire
+            # response when its mean multiplicative error exceeds the threshold.
+            response_token_mask = token_mask[:, 1:]
+            valid_before = (
+                response_token_mask * sample_mask.unsqueeze(-1)
+            ).sum(dim=-1) > 0
+            masking_data = BatchedDataDict(
+                {
+                    "token_mask": token_mask,
+                    "sample_mask": sample_mask,
+                    "prev_logprobs": tensor_field(
+                        data, adv_cfg.policy_logprobs_field
+                    ),
+                    "generation_logprobs": tensor_field(
+                        data, adv_cfg.generation_logprobs_field
+                    ),
+                }
+            )
+            seq_metrics = compute_and_apply_seq_logprob_error_masking(
+                train_data=masking_data,
+                rewards=rewards,
+                seq_logprob_error_threshold=seq_logprob_error_threshold,
+            )
+            sample_mask = masking_data[adv_cfg.sample_mask_field].float()
+            valid_after = (
+                response_token_mask * sample_mask.unsqueeze(-1)
+            ).sum(dim=-1) > 0
+            seq_metrics["_num_valid_seqs_before_mask"] = float(valid_before.sum())
+            seq_metrics["_num_valid_seqs_after_mask"] = float(valid_after.sum())
+            self._step_log_dict["seq_logprob_error_chunks"].append(seq_metrics)
+            fields_to_write[adv_cfg.sample_mask_field] = sample_mask
+
         mask = token_mask * sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {
@@ -887,13 +941,14 @@ class SingleControllerActor:
             response_advantages.detach().cpu()
         )
 
+        fields_to_write[adv_cfg.output_field] = advantages
         await self._call_dp(
             "put_samples",
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
             fields=fields_for_put(
                 meta,
-                {adv_cfg.output_field: advantages},
+                fields_to_write,
             ),
         )
         return meta.with_fields([adv_cfg.output_field])
@@ -911,6 +966,8 @@ class SingleControllerActor:
         ]
         if self._policy_logprobs_required:
             fields.append(adv_cfg.policy_logprobs_field)
+        if self._master_config.grpo.get("seq_logprob_error_threshold") is not None:
+            fields.append(adv_cfg.generation_logprobs_field)
         if self._reference_logprobs_required:
             fields.append(adv_cfg.reference_logprobs_field)
         return list(dict.fromkeys(fields))
