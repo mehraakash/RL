@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Iterator
 from functools import partial
 from typing import Any, Optional, Union
 
@@ -62,7 +63,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.experience.failures import PromptReplacementExhausted, RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -273,9 +274,10 @@ class SingleControllerActor:
     async def _rollout_pump(self) -> None:
         """Continuously dispatch rollout tasks until cancellation.
 
-        Per batch:
+        Per logical batch:
           0. await sampler.admit(...) to wait until the batch may dispatch and
-             obtain its target_step stamp.
+             obtain its target_step stamp. The batch owns exactly
+             ``num_prompts_per_step`` logical slots.
 
         Per prompt:
           1. Acquire _buffer_capacity slot (backpressure)
@@ -284,11 +286,64 @@ class SingleControllerActor:
           4. Call rollout_manager.generate_and_push(prompt) — local async
              RolloutManager reserves a slot, runs the rollout, then commits the
              group via TQReplayBuffer (→ dp_client.put_samples + mark ready)
-          5. Decrement _inflight_rollouts
+          5. If an exact-target slot is skipped, fill that same slot from the
+             next dataset prompt without changing its target_step.
+          6. Decrement _inflight_rollouts
         """
         sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)
         self._rollout_exhausted.clear()
         print("rollout_pump: starting", flush=True)
+
+        max_epochs = self._master_config.grpo.max_num_epochs
+
+        def _iter_prompts() -> Iterator[DatumSpec]:
+            """Flatten dataloader batches while preserving epoch accounting."""
+            while max_epochs is None or self._current_epoch < max_epochs:
+                saw_batch = False
+                for prompt_batch in self._dataloader:
+                    saw_batch = True
+                    for prompt_idx in range(prompt_batch.size):
+                        yield {  # type: ignore
+                            key: value[prompt_idx]
+                            for key, value in prompt_batch.items()
+                        }
+                self._current_epoch += 1
+                if not saw_batch:
+                    return
+
+        prompt_iter = _iter_prompts()
+        prompt_lock = asyncio.Lock()
+        prompt_buffer: list[DatumSpec] = []
+        prompt_source_exhausted = False
+
+        async def _prompt_available() -> bool:
+            """Peek without reserving the prompt from a replacement task."""
+            nonlocal prompt_source_exhausted
+            async with prompt_lock:
+                if prompt_buffer:
+                    return True
+                if prompt_source_exhausted:
+                    return False
+                try:
+                    prompt_buffer.append(next(prompt_iter))
+                except StopIteration:
+                    prompt_source_exhausted = True
+                    return False
+                return True
+
+        async def _next_prompt() -> Optional[DatumSpec]:
+            """Take the next dataset prompt exactly once across all slot tasks."""
+            nonlocal prompt_source_exhausted
+            async with prompt_lock:
+                if prompt_buffer:
+                    return prompt_buffer.pop()
+                if prompt_source_exhausted:
+                    return None
+                try:
+                    return next(prompt_iter)
+                except StopIteration:
+                    prompt_source_exhausted = True
+                    return None
 
         async def _dispatch_one_prompt(
             prompt: DatumSpec,
@@ -298,9 +353,33 @@ class SingleControllerActor:
             task_started_event.set()
             self._inflight_rollouts += 1
             try:
-                outcome = await self._rollout_manager.generate_and_push(
-                    prompt, target_step=target_step
-                )
+                while True:
+                    outcome = await self._rollout_manager.generate_and_push(
+                        prompt, target_step=target_step
+                    )
+                    if outcome is not RolloutOutcome.SKIPPED:
+                        break
+
+                    if target_step is None:
+                        # Non-exact samplers may safely drop the logical slot. Nothing
+                        # was committed, so the train pump cannot release its permit.
+                        self._buffer_capacity.release()
+                        return
+
+                    # In-order selection requires the full target-step cardinality.
+                    # Keep this logical slot (and its permits) alive, but replace the
+                    # permanently bad dataset prompt with the next unassigned prompt.
+                    replacement = await _next_prompt()
+                    if replacement is None:
+                        raise PromptReplacementExhausted(
+                            "dataset exhausted while replacing a skipped prompt for "
+                            f"target_step={target_step}; refusing to leave the in-order "
+                            "training batch permanently short"
+                        )
+                    prompt = replacement
+                    # A replacement is a new dispatch, so honor a refit pause that may
+                    # have started while the failed prompt was running.
+                    await self._rollout_permitted.wait()
             except BaseException:
                 # On success ownership transfers to the train pump, which
                 # releases this permit after consuming the committed group.
@@ -309,12 +388,6 @@ class SingleControllerActor:
             finally:
                 self._inflight_rollouts -= 1
                 sem.release()
-
-            if outcome is RolloutOutcome.SKIPPED:
-                # Nothing was committed, so the train pump will never see this group
-                # and never release its permit on our behalf.
-                self._buffer_capacity.release()
-                return
 
             if self._async_cfg.diagnostics:
                 content = ""
@@ -333,43 +406,52 @@ class SingleControllerActor:
                 self._buffer_capacity.release()
                 sem.release()
 
-        max_epochs = self._master_config.grpo.max_num_epochs
+        groups_per_step = self._master_config.grpo.num_prompts_per_step
+        source_exhausted = False
         async with asyncio.TaskGroup() as rollout_tasks:
-            while max_epochs is None or self._current_epoch < max_epochs:
-                for prompt_batch in self._dataloader:
-                    target_step = await self._sampler.admit(
-                        trainer_version_fn=lambda: self._trainer_version
+            while await _prompt_available():
+                target_step = await self._sampler.admit(
+                    trainer_version_fn=lambda: self._trainer_version
+                )
+
+                for slot_idx in range(groups_per_step):
+                    # check if buffer is full
+                    await self._buffer_capacity.acquire()
+                    # check if inflight rollouts is full
+                    await sem.acquire()
+                    # wait for rollout to be permitted
+                    await self._rollout_permitted.wait()
+
+                    prompt = await _next_prompt()
+                    if prompt is None:
+                        self._buffer_capacity.release()
+                        sem.release()
+                        source_exhausted = True
+                        if slot_idx:
+                            raise PromptReplacementExhausted(
+                                "dataset exhausted after scheduling "
+                                f"{slot_idx}/{groups_per_step} prompt groups for "
+                                f"target_step={target_step}; skipped prompts consumed "
+                                "the remaining replacement supply"
+                            )
+                        break
+
+                    task_started_event = asyncio.Event()
+                    # dispatch rollout
+                    task = rollout_tasks.create_task(
+                        _dispatch_one_prompt(prompt, target_step, task_started_event)
+                    )
+                    self._dispatched_rollouts.add(task)
+                    task.add_done_callback(self._dispatched_rollouts.discard)
+                    task.add_done_callback(
+                        partial(
+                            _release_permits_if_task_not_started,
+                            task_started_event=task_started_event,
+                        )
                     )
 
-                    for prompt_idx in range(prompt_batch.size):
-                        prompt: DatumSpec = {  # type: ignore
-                            k: v[prompt_idx] for k, v in prompt_batch.items()
-                        }
-
-                        # check if buffer is full
-                        await self._buffer_capacity.acquire()
-                        # check if inflight rollouts is full
-                        await sem.acquire()
-                        # wait for rollout to be permitted
-                        await self._rollout_permitted.wait()
-
-                        task_started_event = asyncio.Event()
-                        # dispatch rollout
-                        task = rollout_tasks.create_task(
-                            _dispatch_one_prompt(
-                                prompt, target_step, task_started_event
-                            )
-                        )
-                        self._dispatched_rollouts.add(task)
-                        task.add_done_callback(self._dispatched_rollouts.discard)
-                        task.add_done_callback(
-                            partial(
-                                _release_permits_if_task_not_started,
-                                task_started_event=task_started_event,
-                            )
-                        )
-
-                self._current_epoch += 1
+                if source_exhausted:
+                    break
 
         # Drain in-flight so return implies "all rollouts in TQ".
         inflight = list(self._dispatched_rollouts)

@@ -119,6 +119,10 @@ class RolloutRedispatchExhausted(RuntimeError):
     """
 
 
+class PromptReplacementExhausted(RuntimeError):
+    """No dataset prompt remained to refill an admitted in-order slot."""
+
+
 class RolloutStall(RuntimeError):
     """Rollouts are in flight but none has committed within the watchdog deadline."""
 

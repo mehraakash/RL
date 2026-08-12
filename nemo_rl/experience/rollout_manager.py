@@ -62,7 +62,8 @@ class RolloutOutcome(str, enum.Enum):
     # The prompt group reached the replay buffer.
     COMMITTED = "committed"
     # The prompt exhausted its data-failure budget and on_data_exhausted="skip".
-    # No group was committed, so the caller owns releasing its backpressure permit.
+    # No group was committed, so the caller must either refill its logical slot or
+    # release the slot's backpressure permit.
     SKIPPED = "skipped"
 
 

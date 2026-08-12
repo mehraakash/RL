@@ -41,6 +41,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.failures import PromptReplacementExhausted
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
@@ -100,7 +101,7 @@ def test_rollout_pump_stamps_target_steps(
         diagnostics=False,
     )
     ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+        grpo=GRPOConfig.model_construct(max_num_epochs=1, num_prompts_per_step=1)
     )
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
     # The sampler owns admission + target_step stamping (the dispatch counter
@@ -131,13 +132,12 @@ def test_rollout_pump_stamps_target_steps(
         # A committed group transfers permit ownership to the train pump, which
         # releases it after consuming the group.
         (RolloutOutcome.COMMITTED, False),
-        # A skipped prompt never reaches the buffer, so the train pump will never
-        # see it and the dispatcher must release the permit itself. Getting this
-        # wrong leaks one backpressure slot per skipped prompt until the pump wedges.
+        # A skipped windowed-sampler prompt has no exact target-step quota to refill,
+        # so the dispatcher releases its permit.
         (RolloutOutcome.SKIPPED, True),
     ],
 )
-def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
+def test_rollout_pump_releases_capacity_for_non_exact_sampler_outcomes(
     outcome: RolloutOutcome, expect_permit_released: bool
 ) -> None:
     class _OutcomeRolloutManager:
@@ -151,7 +151,7 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
     ctrl = object.__new__(controller_cls)
     ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
     ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+        grpo=GRPOConfig.model_construct(max_num_epochs=1, num_prompts_per_step=1)
     )
     ctrl._rollout_manager = _OutcomeRolloutManager()
     ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -173,6 +173,128 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
     expected = 2 if expect_permit_released else 1
     assert ctrl._buffer_capacity._value == expected
     assert ctrl._inflight_rollouts == 0
+
+
+def test_rollout_pump_replaces_skipped_prompt_for_in_order_target() -> None:
+    num_prompts_per_step = 32
+
+    class _ReplacingRolloutManager:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int | None]] = []
+            self.committed_targets: list[int | None] = []
+            self._replacement_started = asyncio.Event()
+
+        async def generate_and_push(
+            self, prompt: Any, *, target_step: int | None = None
+        ) -> RolloutOutcome:
+            content = prompt["message_log"][0]["content"]
+            self.calls.append((content, target_step))
+            if content == "bad":
+                return RolloutOutcome.SKIPPED
+            if content == "replacement":
+                self._replacement_started.set()
+            else:
+                # Keep the original 31 successful groups in flight until the bad
+                # slot has claimed the only unassigned replacement prompt.
+                await self._replacement_started.wait()
+            self.committed_targets.append(target_step)
+            return RolloutOutcome.COMMITTED
+
+    async def _main() -> None:
+        manager = _ReplacingRolloutManager()
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=num_prompts_per_step,
+            diagnostics=False,
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(
+                max_num_epochs=1,
+                num_prompts_per_step=num_prompts_per_step,
+            )
+        )
+        ctrl._rollout_manager = manager
+        ctrl._sampler = InOrderSampler(None, max_lookahead_versions=1)
+        initial_prompts = ["bad", *[f"good-{i}" for i in range(31)]]
+        ctrl._dataloader = [
+            BatchedDataDict(
+                {
+                    "message_log": [
+                        [{"role": "user", "content": content}]
+                        for content in initial_prompts
+                    ]
+                }
+            ),
+            BatchedDataDict(
+                {"message_log": [[{"role": "user", "content": "replacement"}]]}
+            ),
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        # in_order/lookahead-1 requires two complete target-step batches.
+        ctrl._buffer_capacity = asyncio.Semaphore(num_prompts_per_step * 2)
+        ctrl._inflight_rollouts = 0
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        await asyncio.wait_for(ctrl._rollout_pump(), timeout=1.0)
+
+        assert len(manager.calls) == num_prompts_per_step + 1
+        assert manager.calls[0] == ("bad", 0)
+        assert ("replacement", 0) in manager.calls
+        assert len(manager.committed_targets) == num_prompts_per_step
+        assert manager.committed_targets == [0] * num_prompts_per_step
+        assert ctrl._buffer_capacity._value == num_prompts_per_step
+        assert ctrl._inflight_rollouts == 0
+        assert ctrl._rollout_exhausted.is_set()
+
+    asyncio.run(_main())
+
+
+def test_rollout_pump_fails_if_in_order_replacement_is_unavailable() -> None:
+    class _SkippingRolloutManager:
+        async def generate_and_push(
+            self, prompt: Any, *, target_step: int | None = None
+        ) -> RolloutOutcome:
+            del prompt, target_step
+            return RolloutOutcome.SKIPPED
+
+    async def _main() -> None:
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=1, diagnostics=False)
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(
+                max_num_epochs=1,
+                num_prompts_per_step=1,
+            )
+        )
+        ctrl._rollout_manager = _SkippingRolloutManager()
+        ctrl._sampler = InOrderSampler(None, max_lookahead_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict({"message_log": [[{"role": "user", "content": "bad"}]]})
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(2)
+        ctrl._inflight_rollouts = 0
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        with pytest.raises(ExceptionGroup) as exc_info:
+            await asyncio.wait_for(ctrl._rollout_pump(), timeout=1.0)
+
+        assert exc_info.value.subgroup(PromptReplacementExhausted) is not None
+        assert ctrl._buffer_capacity._value == 2
+        assert ctrl._inflight_rollouts == 0
+        assert not ctrl._rollout_exhausted.is_set()
+
+    asyncio.run(_main())
 
 
 def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
@@ -210,7 +332,10 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             diagnostics=False,
         )
         ctrl._master_config = SimpleNamespace(
-            grpo=GRPOConfig.model_construct(max_num_epochs=1)
+            grpo=GRPOConfig.model_construct(
+                max_num_epochs=1,
+                num_prompts_per_step=2,
+            )
         )
         ctrl._rollout_manager = manager
         # Over-sampled windowed policy: admit never gates (buffer unused here).
@@ -291,7 +416,10 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
             diagnostics=False,
         )
         ctrl._master_config = SimpleNamespace(
-            grpo=GRPOConfig.model_construct(max_num_epochs=1)
+            grpo=GRPOConfig.model_construct(
+                max_num_epochs=1,
+                num_prompts_per_step=1,
+            )
         )
         ctrl._rollout_manager = _NeverCalledRolloutManager()
         # Over-sampled windowed policy: admit never gates (buffer unused here).
