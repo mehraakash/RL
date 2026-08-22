@@ -292,9 +292,11 @@ def test_train_pump_drives_mcore_training_step(
             sync_weights=lambda *, kv_scales=None: None,
         )
         adv_est = _FakeAdvEstimator()
-        # Rollout manager stub — SC.__init__ only touches ._tq_buffer.
+        # Rollout manager stub for the constructor and weight-sync path.
         rollout_manager = SimpleNamespace(
             _tq_buffer=None,
+            set_next_nemo_gym_task_index=lambda _value: None,
+            get_next_nemo_gym_task_index=lambda: 0,
             set_weight_version=lambda v: ray.get(
                 log.record.remote("set_weight_version", {"version": int(v)})
             ),

@@ -129,9 +129,7 @@ class _FakeImpl:
         self._on_run = on_run
         self.rollout_group_ids: list[str | None] = []
 
-    async def run_rollout(
-        self, input_sample, *, rollout_group_id: str | None = None
-    ):
+    async def run_rollout(self, input_sample, *, rollout_group_id: str | None = None):
         self.rollout_group_ids.append(rollout_group_id)
         if self._on_run is not None:
             await self._on_run(input_sample)
@@ -438,7 +436,6 @@ def _nemo_gym_impl(
 
 
 def test_nemo_gym_inputs_use_attempt_identity_without_mutating_source():
-    rollout_group_id = "12345678-1234-5678-1234-567812345678"
     source_task_index = 17
     input_sample = cast(
         DatumSpec,
@@ -455,31 +452,29 @@ def test_nemo_gym_inputs_use_attempt_identity_without_mutating_source():
         },
     )
     original = deepcopy(input_sample)
-    impl = _nemo_gym_impl(
-        mask_env_flagged_samples=True, num_generations_per_prompt=3
-    )
+    impl = _nemo_gym_impl(mask_env_flagged_samples=True, num_generations_per_prompt=3)
 
-    rows = impl._build_inputs(input_sample, rollout_group_id=rollout_group_id)
+    rows = impl._build_inputs(input_sample, task_index=0)
 
     task_indices = [row[NEMO_GYM_TASK_INDEX_KEY] for row in rows]
     assert len(set(task_indices)) == 1
     assert isinstance(task_indices[0], int)
     assert task_indices[0] != source_task_index
-    assert 0 <= task_indices[0] < 1 << 63
+    assert task_indices[0] == 0
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 2]
     assert [row["_rowidx"] for row in rows] == [0, 1, 2]
     assert input_sample == original
 
 
-def test_nemo_gym_inputs_reject_invalid_attempt_identity():
+def test_nemo_gym_inputs_reject_negative_attempt_identity():
     input_sample = cast(
         DatumSpec,
         {"extra_env_info": {"responses_create_params": {}}},
     )
     impl = _nemo_gym_impl(mask_env_flagged_samples=True)
 
-    with pytest.raises(ValueError, match="rollout_group_id must be a valid UUID"):
-        impl._build_inputs(input_sample, rollout_group_id="not-a-uuid")
+    with pytest.raises(ValueError, match="task index must be non-negative"):
+        impl._build_inputs(input_sample, task_index=-1)
 
 
 def test_nemo_gym_inputs_isolate_repeated_attempts():
@@ -494,16 +489,43 @@ def test_nemo_gym_inputs_isolate_repeated_attempts():
     )
     impl = _nemo_gym_impl(mask_env_flagged_samples=True)
 
-    first = impl._build_inputs(
-        input_sample,
-        rollout_group_id="00000000-0000-4000-8000-000000000001",
-    )
-    second = impl._build_inputs(
-        input_sample,
-        rollout_group_id="00000000-0000-4000-8000-000000000002",
-    )
+    first_index = impl._take_nemo_gym_task_index()
+    second_index = impl._take_nemo_gym_task_index()
+    first = impl._build_inputs(input_sample, task_index=first_index)
+    second = impl._build_inputs(input_sample, task_index=second_index)
 
     assert first[0][NEMO_GYM_TASK_INDEX_KEY] != second[0][NEMO_GYM_TASK_INDEX_KEY]
+    assert impl.get_next_nemo_gym_task_index() == 2
+
+
+def test_nemo_gym_task_index_restore_continues_monotonically():
+    impl = _nemo_gym_impl(mask_env_flagged_samples=True)
+
+    impl.set_next_nemo_gym_task_index(41)
+
+    assert impl._take_nemo_gym_task_index() == 41
+    assert impl.get_next_nemo_gym_task_index() == 42
+
+
+def test_nemo_gym_small_task_identity_is_safe_for_rollout_histograms():
+    impl = _nemo_gym_impl(mask_env_flagged_samples=True, num_generations_per_prompt=16)
+    completions = [
+        Completion(
+            message_log=[{"role": "assistant", "token_ids": [1]}],
+            env_extras={
+                "reward": 1.0,
+                NEMO_GYM_TASK_INDEX_KEY: 0,
+                NEMO_GYM_ROLLOUT_INDEX_KEY: rollout_index,
+            },
+            truncated=False,
+            reward=1.0,
+        )
+        for rollout_index in range(16)
+    ]
+
+    metrics = impl._compute_rollout_metrics(completions, "test_agent")
+
+    assert metrics[f"test_agent/{NEMO_GYM_TASK_INDEX_KEY}/mean"] == 0.0
 
 
 def _mask_gate_result():

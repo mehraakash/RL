@@ -321,6 +321,9 @@ class GRPOSaveState:
     # used to gate the SC buffer restore. None on checkpoints from the other
     # algorithms and from SC runs that predate this field.
     sampler_name: Optional[str] = None
+    # SingleController NeMo-Gym only: the next small monotonic cohort identity.
+    # The default keeps checkpoints written before this field loadable.
+    next_nemo_gym_task_index: int = 0
 
 
 def _initial_grpo_save_state() -> GRPOSaveState:

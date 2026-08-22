@@ -407,6 +407,8 @@ def test_get_grpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
         "val_reward": -99999999.0,
         # SingleController-only field; None for every other algorithm.
         "sampler_name": None,
+        # Older checkpoints default the NeMo-Gym identity counter to zero.
+        "next_nemo_gym_task_index": 0,
     }
     assert "total_valid_tokens" not in loaded_state
     assert not hasattr(save_state, "val:accuracy")
@@ -418,6 +420,7 @@ def test_grpo_save_state_checkpoint_round_trip():
     save_state.total_steps = 4
     save_state.total_valid_tokens = 128
     save_state.val_reward = 0.8
+    save_state.next_nemo_gym_task_index = 37
     setattr(save_state, "val:accuracy", 0.8)
 
     restored_state = _get_grpo_save_state(vars(save_state))
@@ -426,6 +429,7 @@ def test_grpo_save_state_checkpoint_round_trip():
     assert restored_state.total_steps == 4
     assert restored_state.total_valid_tokens == 128
     assert restored_state.val_reward == 0.8
+    assert restored_state.next_nemo_gym_task_index == 37
     assert not hasattr(restored_state, "val:accuracy")
 
 

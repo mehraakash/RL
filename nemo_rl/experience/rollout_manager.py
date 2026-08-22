@@ -16,7 +16,6 @@ import asyncio
 import copy
 import enum
 import json
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -62,7 +61,6 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
-_NEMO_GYM_TASK_INDEX_MASK = (1 << 63) - 1
 
 
 class RolloutOutcome(str, enum.Enum):
@@ -780,8 +778,31 @@ class AsyncNemoGymRolloutImpl:
             else RolloutRetryPolicy.single_attempt()
         ).max_gym_row_attempts
         self._stats = stats
+        # Match the legacy async collector: Gym task identities are small,
+        # monotonically increasing integers. Besides being collision-free, these
+        # remain safe when Gym echoes the identity into numeric rollout metrics;
+        # large UUID-derived integers cannot be represented finely enough for
+        # NumPy/W&B's fixed-width histograms.
+        self._next_nemo_gym_task_index = 0
 
         self._validate_init_params()
+
+    def get_next_nemo_gym_task_index(self) -> int:
+        """Return the next task identity that will be assigned."""
+        return self._next_nemo_gym_task_index
+
+    def set_next_nemo_gym_task_index(self, value: int) -> None:
+        """Restore the task-identity counter from checkpoint state."""
+        value = int(value)
+        if value < 0:
+            raise ValueError("next NeMo-Gym task index must be non-negative")
+        self._next_nemo_gym_task_index = value
+
+    def _take_nemo_gym_task_index(self) -> int:
+        """Allocate one task identity without yielding the actor event loop."""
+        task_index = self._next_nemo_gym_task_index
+        self._next_nemo_gym_task_index += 1
+        return task_index
 
     async def run_rollout(
         self,
@@ -793,9 +814,8 @@ class AsyncNemoGymRolloutImpl:
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
-            rollout_group_id: UUID identifying this rollout attempt. All generated
-                rows share it as their NeMo-Gym task identity. Direct callers that
-                do not reserve through TransferQueue receive a fresh UUID here.
+            rollout_group_id: TransferQueue identity for this attempt. NeMo-Gym uses
+                its own monotonic integer identity, matching the legacy async path.
 
         Returns:
             PromptGroupRecord with num_generations_per_prompt completions.
@@ -804,10 +824,9 @@ class AsyncNemoGymRolloutImpl:
         timer_prefix = "timing/rollout"
         timer.start(f"{timer_prefix}/total")
 
-        if rollout_group_id is None:
-            rollout_group_id = str(uuid.uuid4())
+        del rollout_group_id
         rollout_inputs = self._build_inputs(
-            input_sample, rollout_group_id=rollout_group_id
+            input_sample, task_index=self._take_nemo_gym_task_index()
         )
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
             rollout_inputs, timer, timer_prefix
@@ -843,33 +862,19 @@ class AsyncNemoGymRolloutImpl:
             "Please set `max_rollout_turns` to 1."
         )
 
-    def _build_inputs(
-        self, input_sample: DatumSpec, *, rollout_group_id: str
-    ) -> list[dict]:
+    def _build_inputs(self, input_sample: DatumSpec, *, task_index: int) -> list[dict]:
         """Build and identify N NeMo-Gym rows for one rollout attempt."""
-        try:
-            group_uuid_int = uuid.UUID(rollout_group_id).int
-        except (AttributeError, ValueError) as error:
-            raise ValueError(
-                f"rollout_group_id must be a valid UUID, got {rollout_group_id!r}"
-            ) from error
-
-        # Gym models this field as an integer and serializes requests with
-        # orjson, which rejects integers outside the 64-bit range. Fold both
-        # UUID halves into a non-negative signed-int64 value rather than sending
-        # the raw 128-bit UUID integer.
-        task_index = (
-            group_uuid_int ^ (group_uuid_int >> 64)
-        ) & _NEMO_GYM_TASK_INDEX_MASK
+        if task_index < 0:
+            raise ValueError("NeMo-Gym task index must be non-negative")
 
         # Build a template row from the input_sample's extra_env_info, applying generation params.
         template_row: dict = copy.deepcopy(input_sample["extra_env_info"])  # type: ignore
 
         # NeMo-Gym groups cohort rewards by _ng_task_index. Dataset-provided
-        # indices may be absent or repeat across epochs, and a failed attempt
-        # may still have requests alive inside Gym. The TQ reservation UUID is
-        # already unique per attempt, so use it to isolate this cohort without
-        # changing the source DatumSpec retained in PromptGroupRecord.
+        # indices may be absent or repeat across epochs, and a failed attempt may
+        # still have requests alive inside Gym. The monotonic counter gives each
+        # full attempt a fresh identity without changing the source DatumSpec
+        # retained in PromptGroupRecord. Missing-row re-dispatches reuse these rows.
         template_row[NEMO_GYM_TASK_INDEX_KEY] = task_index
 
         # We do not translate max_seq_len into row-level max_tokens here because that would
@@ -1243,6 +1248,17 @@ class RolloutManager:
             version: Trainer weight version to stamp on future rollout tags.
         """
         self._weight_version = int(version)
+
+    def get_next_nemo_gym_task_index(self) -> int:
+        """Return NeMo-Gym's next monotonic task identity, or zero when unused."""
+        if isinstance(self._impl, AsyncNemoGymRolloutImpl):
+            return self._impl.get_next_nemo_gym_task_index()
+        return 0
+
+    def set_next_nemo_gym_task_index(self, value: int) -> None:
+        """Restore NeMo-Gym's task-identity counter when that path is active."""
+        if isinstance(self._impl, AsyncNemoGymRolloutImpl):
+            self._impl.set_next_nemo_gym_task_index(value)
 
     async def run_rollout(
         self,

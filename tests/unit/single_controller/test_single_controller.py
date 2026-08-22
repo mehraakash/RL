@@ -79,7 +79,11 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        rollout_manager=SimpleNamespace(
+            _tq_buffer=None,
+            set_next_nemo_gym_task_index=lambda _value: None,
+            get_next_nemo_gym_task_index=lambda: 0,
+        ),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
@@ -135,7 +139,11 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        rollout_manager=SimpleNamespace(
+            _tq_buffer=None,
+            set_next_nemo_gym_task_index=lambda _value: None,
+            get_next_nemo_gym_task_index=lambda: 0,
+        ),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
@@ -191,7 +199,11 @@ def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        rollout_manager=SimpleNamespace(
+            _tq_buffer=None,
+            set_next_nemo_gym_task_index=lambda _value: None,
+            get_next_nemo_gym_task_index=lambda: 0,
+        ),
         train_cluster=None,
         inference_cluster=None,
         # A real field of SingleControllerActorArgs. Read directly rather than via a

@@ -237,9 +237,16 @@ class _FakeRolloutManager:
     def __init__(self) -> None:
         self.weight_versions: list[int] = []
         self._tq_buffer = None
+        self.next_nemo_gym_task_index = 0
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
+
+    def get_next_nemo_gym_task_index(self) -> int:
+        return self.next_nemo_gym_task_index
+
+    def set_next_nemo_gym_task_index(self, value: int) -> None:
+        self.next_nemo_gym_task_index = value
 
 
 class _FakeTQBuffer:
@@ -376,6 +383,7 @@ def _make_actor_args(
     save_state: Optional[GRPOSaveState] = None,
     dataloader: Optional[_FakeDataloader] = None,
     tq_buffer: Optional[_FakeTQBuffer] = None,
+    rollout_manager: Optional[_FakeRolloutManager] = None,
     last_checkpoint_path: Optional[str] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
@@ -389,7 +397,9 @@ def _make_actor_args(
         weight_synchronizer=_FakeWeightSynchronizer(),  # type: ignore[arg-type]
         advantage_estimator=None,
         loss_fn=object(),  # type: ignore[arg-type]
-        rollout_manager=_FakeRolloutManager(),  # type: ignore[arg-type]
+        rollout_manager=(
+            rollout_manager if rollout_manager is not None else _FakeRolloutManager()
+        ),  # type: ignore[arg-type]
         tq_buffer=tq_buffer if tq_buffer is not None else _FakeTQBuffer(),  # type: ignore[arg-type]
         partition_id=_PARTITION_ID,
         save_state=(
@@ -509,10 +519,12 @@ class TestCounterRestore:
         save_state.current_epoch = 2
         save_state.consumed_samples = 42
         save_state.total_valid_tokens = 1234
+        save_state.next_nemo_gym_task_index = 57
+        rollout_manager = _FakeRolloutManager()
 
         actor = _ACTOR_CLS(
             _actor_master_config(tmp_path),
-            _make_actor_args(save_state=save_state),
+            _make_actor_args(save_state=save_state, rollout_manager=rollout_manager),
             SetupTimingMetrics(),
         )
 
@@ -524,6 +536,7 @@ class TestCounterRestore:
         assert actor._consumed_samples == 42
         assert actor._current_epoch == 2
         assert actor._total_valid_tokens == 1234
+        assert rollout_manager.next_nemo_gym_task_index == 57
 
     def test_fresh_start_defaults(self, tmp_path):
         actor = _ACTOR_CLS(
@@ -536,6 +549,7 @@ class TestCounterRestore:
         assert actor._consumed_samples == 0
         assert actor._current_epoch == 0
         assert actor._total_valid_tokens == 0
+        assert actor._rollout_manager.next_nemo_gym_task_index == 0
 
     def test_old_checkpoint_without_total_valid_tokens(self, tmp_path):
         # Older checkpoints may predate the total_valid_tokens key;
@@ -558,6 +572,7 @@ class TestCounterRestore:
         assert actor._train_steps == 5
         assert actor._sampler._dispatch_index == 4
         assert actor._total_valid_tokens == 0
+        assert actor._rollout_manager.next_nemo_gym_task_index == 0
 
     def test_resumed_pump_continues_to_max_steps(self, tmp_path):
         # Composes counter restore with a live pump: resuming at step 2 and
@@ -584,6 +599,20 @@ class TestCounterRestore:
 
 
 class TestSaveTrigger:
+    def test_saves_next_nemo_gym_task_index(self, tmp_path):
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
+
+        _run_train_pump(
+            mc,
+            _make_actor_args(),
+            seed=lambda actor: actor._rollout_manager.set_next_nemo_gym_task_index(73),
+        )
+
+        assert (
+            _training_info(tmp_path / "checkpoints", 2)["next_nemo_gym_task_index"]
+            == 73
+        )
+
     def test_saves_on_period_boundary_and_last_step(self, tmp_path):
         mc = _actor_master_config(tmp_path, max_num_steps=4, save_period=2)
         trainer = _FakeTrainer()

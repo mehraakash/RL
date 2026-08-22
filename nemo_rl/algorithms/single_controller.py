@@ -143,6 +143,9 @@ class SingleControllerActor:
         self._loss_fn = actor_args.loss_fn
         self._buffer = actor_args.tq_buffer
         self._rollout_manager = actor_args.rollout_manager
+        self._rollout_manager.set_next_nemo_gym_task_index(
+            actor_args.save_state.next_nemo_gym_task_index
+        )
         # Direct access, deliberately. A getattr default here reads as defensive but
         # buys a silent failure mode: rename or drop the field and
         # watchdog.gym_subprocess_check: true degrades to a health check that iterates
@@ -1528,6 +1531,9 @@ class SingleControllerActor:
         save_state.current_epoch = self._current_epoch
         save_state.consumed_samples = self._consumed_samples
         save_state.total_valid_tokens = self._total_valid_tokens
+        save_state.next_nemo_gym_task_index = (
+            self._rollout_manager.get_next_nemo_gym_task_index()
+        )
         # The restore skips the replay buffer when the resuming run uses a
         # different sampler (its stamps may never be selectable there).
         save_state.sampler_name = self._async_cfg.sampler.name
