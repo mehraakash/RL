@@ -1,0 +1,5 @@
+# V2 streaming arm: begin each training chunk after two prompt groups.
+defaults: swe_sc_cmh_common.yaml
+
+async_rl:
+  min_groups_for_streaming_train: 2
