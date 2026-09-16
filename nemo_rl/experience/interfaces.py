@@ -33,6 +33,10 @@ ROLLOUT_ENV_EXTRA_TAG_PREFIX = "rollout_env_extra:"
 ROLLOUT_GENERATION_LENGTH_TAG = "rollout_generation_length"
 ROLLOUT_REWARD_TAG = "rollout_reward"
 ROLLOUT_TRUNCATED_TAG = "rollout_truncated"
+ROLLOUT_TOTAL_TOKENS_TAG = "rollout_total_tokens"
+ROLLOUT_TURNS_TAG = "rollout_turns"
+ROLLOUT_MAX_GEN_TOKENS_TAG = "rollout_max_gen_tokens"
+ROLLOUT_ENV_FLAG_TAG = "rollout_env_flag"
 
 
 @dataclass

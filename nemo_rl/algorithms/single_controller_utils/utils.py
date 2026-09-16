@@ -31,11 +31,16 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_RESERVED_KEY_PREFIX,
     ROLLOUT_ENV_EXTRA_TAG_PREFIX,
+    ROLLOUT_ENV_FLAG_TAG,
     ROLLOUT_ENVIRONMENT_TAG,
     ROLLOUT_GENERATION_LENGTH_TAG,
+    ROLLOUT_MAX_GEN_TOKENS_TAG,
     ROLLOUT_REWARD_TAG,
+    ROLLOUT_TOTAL_TOKENS_TAG,
     ROLLOUT_TRUNCATED_TAG,
+    ROLLOUT_TURNS_TAG,
 )
+from nemo_rl.experience.metric_utils import calculate_single_metric
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
 _MB_METRIC_MIN: frozenset[str] = frozenset(
@@ -143,6 +148,7 @@ def reduce_advantage_pump_metrics(
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
+    environment_counts: list[dict[str, float]] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
@@ -152,6 +158,7 @@ def reduce_advantage_pump_metrics(
         sequence_lengths: All input_lengths trained on this step.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
+        environment_counts: Selected-row counts after the existing loss masks.
 
     Returns:
         Step-level reward, advantage, token-count, and optional sequence
@@ -178,9 +185,90 @@ def reduce_advantage_pump_metrics(
             out["advantages/min"] = 0.0
     if sequence_lengths:
         out["total_num_tokens"] = float(sum(sequence_lengths))
+    for counts in environment_counts or []:
+        for key, value in counts.items():
+            out[key] = out.get(key, 0.0) + value
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
     return out
+
+
+def environment_sample_counts(
+    tags: list[dict[str, Any]] | None,
+    *,
+    sample_mask: torch.Tensor,
+    token_mask: torch.Tensor,
+) -> dict[str, float]:
+    """Observe final sample weights and weighted next-token targets; never mask."""
+    size = sample_mask.numel()
+    if tags is not None and len(tags) != size:
+        raise ValueError("Environment tags must align with selected samples")
+    counts: dict[str, float] = {}
+    for tag, weight, tokens in zip(
+        tags if tags is not None else [{} for _ in range(size)],
+        sample_mask.detach().cpu().tolist(),
+        token_mask[:, 1:].sum(-1).detach().cpu().tolist(),
+        strict=True,
+    ):
+        environment = _rollout_environment_metric_component(
+            tag.get(ROLLOUT_ENVIRONMENT_TAG, "unknown")
+        )
+        for name, value in (
+            ("num_samples", 1.0),
+            ("num_valid_samples", weight),
+            ("num_valid_tokens", tokens),
+        ):
+            key = f"environment/{environment}/{name}"
+            counts[key] = counts.get(key, 0.0) + value
+    return counts
+
+
+def reduce_environment_rollout_metrics(
+    tags: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Port #4068 distributions to this branch's selected-row metadata path."""
+    cohorts: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for tag in tags:
+        cohorts[tag.get(ROLLOUT_ENVIRONMENT_TAG, "unknown")].append(tag)
+    metrics: dict[str, Any] = {}
+    for environment, rows in cohorts.items():
+        prefix = f"environment/{_rollout_environment_metric_component(environment)}"
+        metrics[f"{prefix}/sample_count"] = len(rows)
+        families = {
+            ROLLOUT_REWARD_TAG: "total_reward",
+            ROLLOUT_GENERATION_LENGTH_TAG: "gen_tokens_per_sample",
+            ROLLOUT_TOTAL_TOKENS_TAG: "total_tokens_per_sample",
+            ROLLOUT_TURNS_TAG: "turns_per_sample",
+            ROLLOUT_MAX_GEN_TOKENS_TAG: "max_gen_tokens_per_turn",
+            ROLLOUT_TRUNCATED_TAG: "truncated",
+        }
+        for tag_key, name in families.items():
+            # Old replay rows must not silently create partial distributions.
+            if not all(tag_key in row for row in rows):
+                continue
+            values = [float(row[tag_key]) for row in rows]
+            metric = f"{prefix}/{name}"
+            metrics.update(calculate_single_metric(values, len(rows), metric))
+            metrics[f"{metric}/p50"] = float(np.percentile(values, 50))
+            metrics[f"{metric}/p95"] = float(np.percentile(values, 95))
+        if all(ROLLOUT_ENV_FLAG_TAG in row for row in rows):
+            # This base does not propagate Gym flags into its SC loss mask.
+            metrics[f"{prefix}/num_env_flagged_samples"] = sum(
+                bool(row[ROLLOUT_ENV_FLAG_TAG]) for row in rows
+            )
+        extra_keys = {
+            key
+            for row in rows
+            for key in row
+            if key.startswith(ROLLOUT_ENV_EXTRA_TAG_PREFIX)
+        }
+        for key in sorted(extra_keys):
+            values = [float(row[key]) for row in rows if key in row]
+            metric = (
+                f"{prefix}/env_extra/{key.removeprefix(ROLLOUT_ENV_EXTRA_TAG_PREFIX)}"
+            )
+            metrics.update(calculate_single_metric(values, len(rows), metric))
+    return metrics
 
 
 def reduce_rollout_length_metrics(

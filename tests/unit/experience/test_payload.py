@@ -123,12 +123,20 @@ def test_record_to_rollout_tags_uses_agent_and_assistant_tokens() -> None:
             ROLLOUT_GENERATION_LENGTH_TAG: 5,
             ROLLOUT_REWARD_TAG: 1.0,
             ROLLOUT_TRUNCATED_TAG: False,
+            "rollout_total_tokens": 8,
+            "rollout_turns": 2,
+            "rollout_max_gen_tokens": 3,
+            "rollout_env_flag": False,
         },
         {
             ROLLOUT_ENVIRONMENT_TAG: "citation_agent",
             ROLLOUT_GENERATION_LENGTH_TAG: 2,
             ROLLOUT_REWARD_TAG: 2.0,
             ROLLOUT_TRUNCATED_TAG: True,
+            "rollout_total_tokens": 5,
+            "rollout_turns": 2,
+            "rollout_max_gen_tokens": 2,
+            "rollout_env_flag": False,
         },
     ]
 
@@ -139,6 +147,20 @@ def test_record_to_rollout_tags_falls_back_to_native_task_name() -> None:
     record.metadata["task_name"] = " native-task "
 
     assert record_to_rollout_tags(record)[0][ROLLOUT_ENVIRONMENT_TAG] == "native-task"
+
+
+def test_environment_flag_is_telemetry_only() -> None:
+    completion = _completion(route_start=10, reward=0.0)
+    completion.env_extras = {"instance_config": {"mask_sample": True}}
+    record = _record([completion])
+    assert record_to_rollout_tags(record)[0]["rollout_env_flag"] is True
+    # Preserve the pinned base: observing a Gym flag does not apply a new mask.
+    batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "generation_logprobs": 0, "token_loss_mask": 0},
+    )
+    assert batch["sample_mask"].tolist() == [1.0]
+    assert completion.env_extras["instance_config"]["mask_sample"] is True
 
 
 def test_record_to_rollout_tags_carries_only_public_finite_numeric_extras() -> None:

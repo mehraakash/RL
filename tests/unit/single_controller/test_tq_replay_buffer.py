@@ -288,6 +288,10 @@ class TestTQReplayBufferReserveCommit:
                 ROLLOUT_GENERATION_LENGTH_TAG: 1,
                 ROLLOUT_REWARD_TAG: 0.0,
                 ROLLOUT_TRUNCATED_TAG: False,
+                "rollout_total_tokens": 1,
+                "rollout_turns": 0,
+                "rollout_max_gen_tokens": 1,
+                "rollout_env_flag": False,
             },
             {
                 "weight_version": 3,
@@ -295,6 +299,10 @@ class TestTQReplayBufferReserveCommit:
                 ROLLOUT_GENERATION_LENGTH_TAG: 2,
                 ROLLOUT_REWARD_TAG: 0.0,
                 ROLLOUT_TRUNCATED_TAG: True,
+                "rollout_total_tokens": 2,
+                "rollout_turns": 0,
+                "rollout_max_gen_tokens": 2,
+                "rollout_env_flag": False,
             },
         ]
         assert len(dp.put_calls) == 1

@@ -28,10 +28,14 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_RESERVED_KEY_PREFIX,
     ROLLOUT_ENV_EXTRA_TAG_PREFIX,
+    ROLLOUT_ENV_FLAG_TAG,
     ROLLOUT_ENVIRONMENT_TAG,
     ROLLOUT_GENERATION_LENGTH_TAG,
+    ROLLOUT_MAX_GEN_TOKENS_TAG,
     ROLLOUT_REWARD_TAG,
+    ROLLOUT_TOTAL_TOKENS_TAG,
     ROLLOUT_TRUNCATED_TAG,
+    ROLLOUT_TURNS_TAG,
     PromptGroupRecord,
 )
 
@@ -83,6 +87,23 @@ def record_to_rollout_tags(record: PromptGroupRecord) -> list[dict[str, Any]]:
             ),
             ROLLOUT_REWARD_TAG: float(completion.reward),
             ROLLOUT_TRUNCATED_TAG: bool(completion.truncated),
+            ROLLOUT_TOTAL_TOKENS_TAG: sum(
+                len(m["token_ids"]) for m in completion.message_log
+            ),
+            ROLLOUT_TURNS_TAG: sum(m["role"] == "user" for m in completion.message_log),
+            ROLLOUT_MAX_GEN_TOKENS_TAG: max(
+                (
+                    len(m["token_ids"])
+                    for m in completion.message_log
+                    if m["role"] == "assistant"
+                ),
+                default=0,
+            ),
+            ROLLOUT_ENV_FLAG_TAG: bool(
+                ((completion.env_extras or {}).get("instance_config") or {}).get(
+                    "mask_sample", False
+                )
+            ),
         }
         if isinstance(completion.env_extras, dict):
             for key, value in completion.env_extras.items():

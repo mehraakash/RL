@@ -63,8 +63,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
+    environment_sample_counts,
     fields_for_put,
     reduce_advantage_pump_metrics,
+    reduce_environment_rollout_metrics,
     reduce_rollout_length_metrics,
     squeeze_trailing_unit_dim,
     tensor_field,
@@ -278,6 +280,7 @@ class SingleControllerActor:
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
             "rollout_tags": [],
+            "environment_counts": [],
         }
 
         print(
@@ -1343,6 +1346,9 @@ class SingleControllerActor:
                 step_metrics.update(
                     reduce_advantage_pump_metrics(
                         rewards=self._step_log_dict["rewards"],
+                        environment_counts=self._step_log_dict.get(
+                            "environment_counts", []
+                        ),
                         masked_advantages=self._step_log_dict["masked_advantages"],
                         sequence_lengths=self._step_log_dict["sequence_lengths"],
                         seq_logprob_error_metrics=self._step_log_dict[
@@ -1352,6 +1358,11 @@ class SingleControllerActor:
                 )
                 step_metrics.update(
                     reduce_rollout_length_metrics(self._step_log_dict["rollout_tags"])
+                )
+                step_metrics.update(
+                    reduce_environment_rollout_metrics(
+                        self._step_log_dict["rollout_tags"]
+                    )
                 )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
 
@@ -2061,6 +2072,11 @@ class SingleControllerActor:
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
 
         mask = token_mask * sample_mask.unsqueeze(-1)
+        self._step_log_dict.setdefault("environment_counts", []).append(
+            environment_sample_counts(
+                meta.tags, sample_mask=sample_mask, token_mask=mask
+            )
+        )
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,

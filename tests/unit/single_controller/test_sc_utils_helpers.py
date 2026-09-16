@@ -24,8 +24,10 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
+    environment_sample_counts,
     fields_for_put,
     reduce_advantage_pump_metrics,
+    reduce_environment_rollout_metrics,
     reduce_rollout_length_metrics,
     squeeze_trailing_unit_dim,
     tensor_field,
@@ -47,6 +49,60 @@ def _meta(size: int, sequence_lengths: list[int] | None = None) -> KVBatchMeta:
         sample_ids=[f"s{i}" for i in range(size)],
         sequence_lengths=sequence_lengths,
     )
+
+
+def test_environment_counts_preserve_weights_and_sum_chunks() -> None:
+    tags = [{ROLLOUT_ENVIRONMENT_TAG: env} for env in ["swe", "math", "swe"]]
+    weights = torch.tensor([0.5, 0.0, 1.0])
+    mask = torch.tensor([[0.0, 0.5, 0.5], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    records = [
+        environment_sample_counts(
+            tags[:2], sample_mask=weights[:2], token_mask=mask[:2]
+        ),
+        environment_sample_counts(
+            tags[2:], sample_mask=weights[2:], token_mask=mask[2:]
+        ),
+    ]
+    out = reduce_advantage_pump_metrics([], [], [], environment_counts=records)
+    assert out == {
+        "environment/swe/num_samples": 2,
+        "environment/swe/num_valid_samples": 1.5,
+        "environment/swe/num_valid_tokens": 1,
+        "environment/math/num_samples": 1,
+        "environment/math/num_valid_samples": 0,
+        "environment/math/num_valid_tokens": 0,
+    }
+    assert weights.tolist() == [0.5, 0, 1]
+    unknown = environment_sample_counts(
+        None, sample_mask=weights[:1], token_mask=mask[:1]
+    )
+    assert unknown["environment/unknown/num_valid_samples"] == 0.5
+    with pytest.raises(ValueError, match="align"):
+        environment_sample_counts([], sample_mask=weights, token_mask=mask)
+
+
+def test_environment_distributions_use_selected_rows_and_keep_flags_separate() -> None:
+    tags = [
+        {
+            ROLLOUT_ENVIRONMENT_TAG: "swe",
+            ROLLOUT_REWARD_TAG: reward,
+            ROLLOUT_GENERATION_LENGTH_TAG: length,
+            "rollout_env_flag": flagged,
+        }
+        for reward, length, flagged in [(0.0, 10, True), (1.0, 30, False)]
+    ]
+    tags.append({ROLLOUT_ENVIRONMENT_TAG: "math", ROLLOUT_REWARD_TAG: 3.0})
+    out = reduce_environment_rollout_metrics(tags)
+    assert out["environment/swe/total_reward/mean"] == 0.5
+    assert out["environment/swe/gen_tokens_per_sample/p95"] == 29
+    assert out["environment/swe/sample_count"] == 2
+    assert out["environment/swe/num_env_flagged_samples"] == 1
+    assert "environment/swe/num_mask_sample_filtered" not in out
+    assert sum(out["environment/swe/total_reward/histogram"].histogram) == 2
+    old = reduce_environment_rollout_metrics(tags + [{ROLLOUT_ENVIRONMENT_TAG: "swe"}])
+    assert "environment/swe/total_reward/mean" not in old
+    assert "environment/swe/num_env_flagged_samples" not in old
+    assert old["environment/math/total_reward/mean"] == 3
 
 
 class TestSqueezeTrailingUnitDim:

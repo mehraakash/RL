@@ -390,6 +390,13 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1
     assert metrics[0]["num_masked_seqs_by_logprob_error"] == 1
+    assert ctrl._step_log_dict["environment_counts"] == [
+        {
+            "environment/unknown/num_samples": 4.0,
+            "environment/unknown/num_valid_samples": 3.0,
+            "environment/unknown/num_valid_tokens": 12.0,
+        }
+    ]
     assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(1.0)
     assert "advantages" in (result_meta.fields or [])
