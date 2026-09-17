@@ -281,6 +281,7 @@ class SingleControllerActor:
             "seq_logprob_error_metrics": [],
             "rollout_tags": [],
             "environment_counts": [],
+            "num_mask_sample_filtered": [],
         }
 
         print(
@@ -1335,7 +1336,8 @@ class SingleControllerActor:
                 if not step_open:
                     raise RuntimeError(
                         "SingleController has no valid response tokens after "
-                        "filtering. Check grpo.seq_logprob_error_threshold to "
+                        "filtering. Check grpo.seq_logprob_error_threshold, "
+                        "overlong_filtering, and environment mask_sample flags to "
                         "avoid an optimizer step with an empty batch."
                     )
 
@@ -1348,6 +1350,9 @@ class SingleControllerActor:
                         rewards=self._step_log_dict["rewards"],
                         environment_counts=self._step_log_dict.get(
                             "environment_counts", []
+                        ),
+                        num_mask_sample_filtered=self._step_log_dict.get(
+                            "num_mask_sample_filtered", []
                         ),
                         masked_advantages=self._step_log_dict["masked_advantages"],
                         sequence_lengths=self._step_log_dict["sequence_lengths"],
@@ -2026,6 +2031,18 @@ class SingleControllerActor:
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
+        mask_sample = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.mask_sample_field)
+        ).bool()
+        truncated = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.truncated_field)
+        ).bool()
+        self._step_log_dict.setdefault("num_mask_sample_filtered", []).append(
+            int(mask_sample.sum().item())
+        )
+        final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
+        if self._master_config.grpo.overlong_filtering:
+            final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
 
         seq_logprob_error_threshold = (
             self._master_config.grpo.seq_logprob_error_threshold
@@ -2037,7 +2054,7 @@ class SingleControllerActor:
             masking_data = BatchedDataDict(
                 {
                     "token_mask": token_mask,
-                    "sample_mask": sample_mask,
+                    "sample_mask": final_sample_mask,
                     "prev_logprobs": tensor_field(
                         data,
                         adv_cfg.policy_logprobs_field,
@@ -2049,7 +2066,7 @@ class SingleControllerActor:
                 }
             )
             num_valid_seqs_before = float(
-                ((token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
+                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
                 .sum()
                 .item()
             )
@@ -2058,9 +2075,9 @@ class SingleControllerActor:
                 rewards=rewards,
                 seq_logprob_error_threshold=seq_logprob_error_threshold,
             )
-            sample_mask = masking_data["sample_mask"]
+            final_sample_mask = masking_data["sample_mask"]
             num_valid_seqs_after = float(
-                ((token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
+                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
                 .sum()
                 .item()
             )
@@ -2071,10 +2088,13 @@ class SingleControllerActor:
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
 
-        mask = token_mask * sample_mask.unsqueeze(-1)
+        mask = token_mask * final_sample_mask.unsqueeze(-1)
         self._step_log_dict.setdefault("environment_counts", []).append(
             environment_sample_counts(
-                meta.tags, sample_mask=sample_mask, token_mask=mask
+                meta.tags,
+                sample_mask=final_sample_mask,
+                token_mask=mask,
+                mask_sample=mask_sample,
             )
         )
 
@@ -2118,8 +2138,8 @@ class SingleControllerActor:
         )
 
         fields_to_put = {adv_cfg.output_field: advantages}
-        if seq_logprob_error_threshold is not None:
-            fields_to_put[adv_cfg.sample_mask_field] = sample_mask
+        if not torch.equal(final_sample_mask, sample_mask):
+            fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
 
         await self._call_dp(
             "put_samples",
@@ -2141,6 +2161,8 @@ class SingleControllerActor:
             adv_cfg.reward_field,
             adv_cfg.token_mask_field,
             adv_cfg.sample_mask_field,
+            adv_cfg.mask_sample_field,
+            adv_cfg.truncated_field,
             *adv_cfg.repeated_batch_fields,
         ]
         if self._policy_logprobs_required:

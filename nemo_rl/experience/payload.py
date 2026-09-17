@@ -23,7 +23,7 @@ from tensordict import TensorDict
 
 from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
-from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTED_EXPERTS_FIELD, TRUNCATED
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_RESERVED_KEY_PREFIX,
@@ -133,7 +133,8 @@ def record_to_train_batch(
 
     Returns:
         BatchedDataDict with input_ids, input_lengths, generation_logprobs, token_mask,
-        sample_mask, prompt_ids_for_adv, total_reward, and optional routed_experts.
+        an all-ones sample_mask, raw mask_sample and truncated flags,
+        prompt_ids_for_adv, total_reward, and optional routed_experts.
     """
     # Lazy imports: grpo and llm_message_utils transitively pull
     # experience.rollouts, so importing at module top risks a cycle.
@@ -142,7 +143,10 @@ def record_to_train_batch(
         extract_initial_prompt_messages,
     )
     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-    from nemo_rl.experience.rollouts import backfill_missing_routed_experts
+    from nemo_rl.experience.rollouts import (
+        _mask_sample_flags,
+        backfill_missing_routed_experts,
+    )
 
     completions = record.completions
     n = len(completions)
@@ -180,6 +184,8 @@ def record_to_train_batch(
         "generation_logprobs": flat["generation_logprobs"],
         "token_mask": flat["token_loss_mask"],
         "sample_mask": sample_mask,
+        MASK_SAMPLE: _mask_sample_flags(c.env_extras for c in completions),
+        TRUNCATED: torch.tensor([c.truncated for c in completions], dtype=torch.bool),
         "prompt_ids_for_adv": prompt_flat["token_ids"],
         "total_reward": total_reward,
     }

@@ -75,6 +75,19 @@ def test_promote_1d_roundtrip_via_from_wire() -> None:
     assert torch.equal(back["input_lengths"], original)
 
 
+@pytest.mark.parametrize("field_name", ["mask_sample", "truncated"])
+def test_raw_sample_filter_fields_roundtrip_as_dense_1d(field_name: str) -> None:
+    from tensordict import TensorDict
+    from nemo_rl.data_plane.adapters.transfer_queue import _from_wire, _promote_1d_leaves
+
+    original = torch.tensor([False, True, False, True])
+    wire = _promote_1d_leaves(TensorDict({field_name: original}, batch_size=[4]))
+    assert wire[field_name].shape == (4, 1)
+    back = _from_wire(wire)
+    assert back[field_name].shape == (4,)
+    assert torch.equal(back[field_name], original)
+
+
 def test_from_wire_densifies_uniform_nested_rows() -> None:
     """TQ v0.1.9's uniform nested reads are restored to dense tensors."""
     from tensordict import TensorDict

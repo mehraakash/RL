@@ -341,6 +341,8 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
             "total_reward": torch.tensor([0.0, 0.0, 1.0, 0.0]),
             "token_mask": torch.ones(batch_size, sequence_length),
             "sample_mask": torch.ones(batch_size),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
             "prev_logprobs": torch.zeros(batch_size, sequence_length),
             "generation_logprobs": generation_logprobs,
         },
@@ -357,7 +359,7 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
+        grpo=SimpleNamespace(overlong_filtering=False, seq_logprob_error_threshold=2.0)
     )
     ctrl._step_log_dict = {
         "rewards": [],
@@ -393,6 +395,7 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     assert ctrl._step_log_dict["environment_counts"] == [
         {
             "environment/unknown/num_samples": 4.0,
+            "environment/unknown/num_mask_sample_filtered": 0.0,
             "environment/unknown/num_valid_samples": 3.0,
             "environment/unknown/num_valid_tokens": 12.0,
         }
@@ -400,6 +403,71 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(1.0)
     assert "advantages" in (result_meta.fields or [])
+
+
+@pytest.mark.parametrize(
+    "overlong,all_masked", [(False, False), (True, False), (False, True)]
+)
+def test_3766_composes_filters_without_3837(overlong: bool, all_masked: bool) -> None:
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.ones(4, 5, dtype=torch.long),
+            "total_reward": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            "token_mask": torch.ones(4, 5),
+            "sample_mask": torch.ones(4),
+            "mask_sample": torch.ones(4, dtype=torch.bool)
+            if all_masked
+            else torch.tensor([False, True, False, False]),
+            "truncated": torch.tensor([False, True, False, True]),
+            "prev_logprobs": torch.zeros(4, 5),
+            "generation_logprobs": torch.tensor(
+                [[0.0] * 5, [0.0] * 5, [0.0, 1.0, 1.0, 1.0, 1.0], [0.0] * 5]
+            ),
+        },
+        batch_size=[4],
+    )
+    ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+    ctrl._dp_client = _AdvantageDataPlane(data)
+    ctrl._advantage_cfg = AdvantageConfig()
+
+    # A strict signature rejects valid_mask: #3837 must not enter this backport.
+    def compute(*, prompt_ids, rewards, mask, repeated_batch, logprobs_policy):
+        assert rewards.tolist() == [1.0, 0.0, 0.0, 0.0]
+        return mask.clone()
+
+    estimator = SimpleNamespace(compute_advantage=MagicMock(side_effect=compute))
+    ctrl._advantage_estimator = estimator
+    ctrl._policy_logprobs_required = True
+    ctrl._reference_logprobs_required = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=SimpleNamespace(
+            overlong_filtering=overlong, seq_logprob_error_threshold=2.0
+        )
+    )
+    ctrl._step_log_dict = {
+        key: [] for key in ["rewards", "masked_advantages", "seq_logprob_error_metrics"]
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[str(i) for i in range(4)],
+        fields=list(data.keys()),
+        tags=[{"rollout_environment": "swe"}] * 4,
+    )
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    expected = (
+        [0.0, 0.0, 0.0, 0.0] if all_masked else [1.0, 0.0, 0.0, float(not overlong)]
+    )
+    assert ctrl._dp_client.written_fields["sample_mask"].tolist() == expected
+    assert valid is (not all_masked)
+    assert estimator.compute_advantage.call_count == int(not all_masked)
+    assert ctrl._step_log_dict["num_mask_sample_filtered"] == [4 if all_masked else 1]
+    counts = ctrl._step_log_dict["environment_counts"][0]
+    assert counts["environment/swe/num_mask_sample_filtered"] == (
+        4 if all_masked else 1
+    )
+    assert counts["environment/swe/num_valid_samples"] == sum(expected)
+    assert counts["environment/swe/num_valid_tokens"] == 4 * sum(expected)
 
 
 def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
@@ -414,6 +482,8 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
             "total_reward": torch.tensor([0.0, 1.0]),
             "token_mask": torch.ones(batch_size, sequence_length),
             "sample_mask": torch.ones(batch_size),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
             "prev_logprobs": torch.zeros(batch_size, sequence_length),
             "generation_logprobs": generation_logprobs,
         },
@@ -430,7 +500,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None)
+        grpo=SimpleNamespace(overlong_filtering=False, seq_logprob_error_threshold=None)
     )
     ctrl._step_log_dict = {
         "rewards": [],
@@ -474,6 +544,8 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
             "total_reward": torch.tensor([1.0, 0.0]),
             "token_mask": torch.ones(batch_size, sequence_length),
             "sample_mask": torch.ones(batch_size),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
             "prev_logprobs": torch.zeros(batch_size, sequence_length),
             "generation_logprobs": torch.ones(batch_size, sequence_length),
         },
@@ -490,7 +562,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
+        grpo=SimpleNamespace(overlong_filtering=False, seq_logprob_error_threshold=2.0)
     )
     ctrl._step_log_dict = {
         "rewards": [],
@@ -529,6 +601,8 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
             "total_reward": torch.tensor([1.0, 0.0]),
             "token_mask": torch.ones(batch_size, sequence_length),
             "sample_mask": torch.zeros(batch_size),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
         },
         batch_size=[batch_size],
     )
@@ -543,7 +617,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None)
+        grpo=SimpleNamespace(overlong_filtering=False, seq_logprob_error_threshold=None)
     )
     ctrl._step_log_dict = {
         "rewards": [],

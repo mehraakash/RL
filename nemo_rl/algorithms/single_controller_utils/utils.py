@@ -149,6 +149,7 @@ def reduce_advantage_pump_metrics(
     sequence_lengths: list[int],
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
     environment_counts: list[dict[str, float]] | None = None,
+    num_mask_sample_filtered: list[int] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
@@ -159,6 +160,7 @@ def reduce_advantage_pump_metrics(
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
         environment_counts: Selected-row counts after the existing loss masks.
+        num_mask_sample_filtered: Gym flag counts across selected chunks.
 
     Returns:
         Step-level reward, advantage, token-count, and optional sequence
@@ -188,6 +190,8 @@ def reduce_advantage_pump_metrics(
     for counts in environment_counts or []:
         for key, value in counts.items():
             out[key] = out.get(key, 0.0) + value
+    if num_mask_sample_filtered is not None:
+        out["num_mask_sample_filtered"] = float(sum(num_mask_sample_filtered))
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
     return out
@@ -198,16 +202,23 @@ def environment_sample_counts(
     *,
     sample_mask: torch.Tensor,
     token_mask: torch.Tensor,
+    mask_sample: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Observe final sample weights and weighted next-token targets; never mask."""
     size = sample_mask.numel()
     if tags is not None and len(tags) != size:
         raise ValueError("Environment tags must align with selected samples")
     counts: dict[str, float] = {}
-    for tag, weight, tokens in zip(
+    flags = (
+        mask_sample.detach().cpu().tolist()
+        if mask_sample is not None
+        else [None] * size
+    )
+    for tag, weight, tokens, flagged in zip(
         tags if tags is not None else [{} for _ in range(size)],
         sample_mask.detach().cpu().tolist(),
         token_mask[:, 1:].sum(-1).detach().cpu().tolist(),
+        flags,
         strict=True,
     ):
         environment = _rollout_environment_metric_component(
@@ -220,6 +231,9 @@ def environment_sample_counts(
         ):
             key = f"environment/{environment}/{name}"
             counts[key] = counts.get(key, 0.0) + value
+        if flagged is not None:
+            key = f"environment/{environment}/num_mask_sample_filtered"
+            counts[key] = counts.get(key, 0.0) + int(flagged)
     return counts
 
 
@@ -252,7 +266,7 @@ def reduce_environment_rollout_metrics(
             metrics[f"{metric}/p50"] = float(np.percentile(values, 50))
             metrics[f"{metric}/p95"] = float(np.percentile(values, 95))
         if all(ROLLOUT_ENV_FLAG_TAG in row for row in rows):
-            # This base does not propagate Gym flags into its SC loss mask.
+            # Raw flags, before any overlapping training-time filters.
             metrics[f"{prefix}/num_env_flagged_samples"] = sum(
                 bool(row[ROLLOUT_ENV_FLAG_TAG]) for row in rows
             )

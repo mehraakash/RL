@@ -21,7 +21,7 @@ import json
 import statistics
 import warnings
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -266,16 +266,16 @@ def _add_r3_fallback_metrics(
     )
 
 
-def _extract_mask_sample_flags(results: list[dict[str, Any]]) -> torch.Tensor:
+def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
     """Return True for samples the environment asks GRPO to mask from loss."""
     return torch.tensor(
         [
             bool(
-                (result["full_result"].get("instance_config") or {}).get(
+                ((extra or {}).get("instance_config") or {}).get(
                     "mask_sample", False
                 )
             )
-            for result in results
+            for extra in extras
         ],
         dtype=torch.bool,
     )
@@ -2796,7 +2796,9 @@ def _postprocess_single_nemo_gym_group(
     # Env/agent mask flag: flagged samples are dropped from the loss but still
     # count for advantages. env.should_mask_flagged_samples=false skips this.
     if mask_env_flagged_samples:
-        final_batch["mask_sample"] = _extract_mask_sample_flags(results)
+        final_batch["mask_sample"] = _mask_sample_flags(
+            result["full_result"] for result in results
+        )
 
     if length_rewards_low:
         rollout_metrics["mean_length_reward_low"] = sum(length_rewards_low) / len(

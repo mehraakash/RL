@@ -149,17 +149,22 @@ def test_record_to_rollout_tags_falls_back_to_native_task_name() -> None:
     assert record_to_rollout_tags(record)[0][ROLLOUT_ENVIRONMENT_TAG] == "native-task"
 
 
-def test_environment_flag_is_telemetry_only() -> None:
+def test_environment_flag_is_carried_raw_until_advantage_stage() -> None:
     completion = _completion(route_start=10, reward=0.0)
     completion.env_extras = {"instance_config": {"mask_sample": True}}
     record = _record([completion])
     assert record_to_rollout_tags(record)[0]["rollout_env_flag"] is True
-    # Preserve the pinned base: observing a Gym flag does not apply a new mask.
+    # Apply the flag once, in the controller, not while constructing the payload.
     batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "generation_logprobs": 0, "token_loss_mask": 0},
     )
     assert batch["sample_mask"].tolist() == [1.0]
+    assert batch["mask_sample"].tolist() == [True]
+    assert batch["truncated"].tolist() == [False]
+    _, fields, _ = pack_payload(batch, weight_version=0, group_id="masked")
+    assert fields["mask_sample"].tolist() == [True]
+    assert fields["truncated"].tolist() == [False]
     assert completion.env_extras["instance_config"]["mask_sample"] is True
 
 
