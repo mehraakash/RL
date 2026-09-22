@@ -224,6 +224,12 @@ class SingleControllerActor:
         # consumed but before all of that batch's prompts have reserved buffer
         # slots and become part of the exact regeneration journal.
         self._rollout_checkpoint_lock: asyncio.Lock = asyncio.Lock()
+        # Read-only telemetry for the existing status loop; never controls execution.
+        self._train_phase = "not_started"
+        self._rollout_phase = "not_started"
+        # Only reported as owner while the lock is held. Updated immediately after
+        # acquisition, without an intervening await; no extra lock or release needed.
+        self._checkpoint_lock_last_owner: Optional[str] = None
         self._prefetched_dataloader_state: Optional[dict[str, Any]] = None
         self._pending_rollouts_to_regenerate: list[dict[str, Any]] = []
         self._active_rollout_prompts: dict[str, dict[str, Any]] = {}
@@ -735,10 +741,13 @@ class SingleControllerActor:
 
         async def _launch(prompt: DatumSpec, target_step: Optional[int]) -> None:
             # check if buffer is full
+            self._rollout_phase = "buffer_capacity"
             await self._buffer_capacity.acquire()
             # check if inflight rollouts is full
+            self._rollout_phase = "inflight_capacity"
             await sem.acquire()
             # wait for rollout to be permitted
+            self._rollout_phase = "rollout_permission"
             await self._rollout_permitted.wait()
 
             task_started_event = asyncio.Event()
@@ -779,7 +788,9 @@ class SingleControllerActor:
             accounts_for_prefetched_batch: bool = False,
             regenerated_journal_ids: Optional[set[str]] = None,
         ) -> None:
+            self._rollout_phase = "checkpoint_lock"
             async with self._rollout_checkpoint_lock:
+                self._checkpoint_lock_last_owner = "rollout"
                 for prompt in prompts:
                     await _launch(prompt, target_step)
                 if regenerated_journal_ids:
@@ -793,6 +804,7 @@ class SingleControllerActor:
                     # a live buffer slot carrying its source prompt. The live
                     # dataloader cursor is safe to checkpoint past the batch.
                     self._prefetched_dataloader_state = None
+            self._rollout_phase = "batch_dispatched"
 
         async def _regenerate_checkpoint_prompts() -> None:
             """Freshly roll out the exact journal discarded on resume."""
@@ -804,6 +816,7 @@ class SingleControllerActor:
             target_steps = sorted(set(rollouts_by_target).union(self._batch_shortfall))
             for target_step in target_steps:
                 target_rollouts = rollouts_by_target.get(target_step, [])
+                self._rollout_phase = "sampler_admission"
                 admitted_target = await self._sampler.admit(
                     trainer_version_fn=lambda: self._trainer_version
                 )
@@ -848,6 +861,7 @@ class SingleControllerActor:
                         self._prefetched_dataloader_state = None
                         continue
 
+                    self._rollout_phase = "sampler_admission"
                     target_step = await self._sampler.admit(
                         trainer_version_fn=lambda: self._trainer_version
                     )
@@ -879,6 +893,7 @@ class SingleControllerActor:
                     )
 
                 self._current_epoch += 1
+            self._rollout_phase = "inflight_completion"
 
         # Only now that every dispatched rollout has settled is the pool genuinely
         # spare. Draining it inside the group above would race them for it, and a
@@ -887,13 +902,16 @@ class SingleControllerActor:
         # left over. A second group because the first is closed to new tasks.
         async with asyncio.TaskGroup() as rollout_tasks:
             await self._drain_reserve_into_steps(_launch_batch)
+            self._rollout_phase = "inflight_completion"
 
         # Drain in-flight so return implies "all rollouts in TQ".
         inflight = list(self._dispatched_rollouts)
         if inflight:
+            self._rollout_phase = "inflight_completion"
             await asyncio.gather(*inflight, return_exceptions=True)
 
         self._rollout_exhausted.set()
+        self._rollout_phase = "finished"
         print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
 
     def _divert_batch_to_reserve(
@@ -966,6 +984,7 @@ class SingleControllerActor:
         while len(self._replacement_reserve) >= num_prompts_per_step:
             # All ordinary rollout tasks settled before this drain starts, so
             # nothing can draw from the spare pool while admission waits.
+            self._rollout_phase = "sampler_admission"
             target_step = await self._sampler.admit(
                 trainer_version_fn=lambda: self._trainer_version
             )
@@ -1141,6 +1160,7 @@ class SingleControllerActor:
                         await asyncio.sleep(0)
 
                         # Evict stale groups
+                        self._train_phase = "sampler_evict"
                         evicted = await self._sampler.evict(
                             current_train_weight=self._trainer_version,
                         )
@@ -1170,6 +1190,7 @@ class SingleControllerActor:
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
+                        self._train_phase = "sampler_select"
                         train_meta, num_groups = await self._sampler.select(
                             current_train_weight=self._trainer_version,
                             min_prompt_groups=min_prompt_groups,
@@ -1198,6 +1219,7 @@ class SingleControllerActor:
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
+                            self._train_phase = "ready_groups"
                             await asyncio.sleep(0.005)
                             continue
 
@@ -1226,16 +1248,19 @@ class SingleControllerActor:
                             # and its reload zeroes it, so offloading here would
                             # discard every chunk but the last while the 1/N
                             # normalizer still counts all of them.
+                            self._train_phase = "prepare_logprobs"
                             await asyncio.to_thread(
                                 self._trainer.prepare_for_lp_inference,
                                 keep_train_buffers=step_open,
                             )
                         with self._timer.time("policy_and_reference_logprobs"):
                             if self._policy_logprobs_required:
+                                self._train_phase = "policy_logprobs"
                                 await asyncio.to_thread(
                                     self._trainer.get_logprobs_from_meta, train_meta
                                 )
                             if self._reference_logprobs_required:
+                                self._train_phase = "reference_logprobs"
                                 await asyncio.to_thread(
                                     self._trainer.get_reference_policy_logprobs_from_meta,
                                     train_meta,
@@ -1243,6 +1268,7 @@ class SingleControllerActor:
 
                     # Compute advantages
                     with self._timer.time("advantage_calculation"):
+                        self._train_phase = "advantage_stage"
                         (
                             train_meta,
                             has_valid_training_tokens,
@@ -1253,15 +1279,18 @@ class SingleControllerActor:
                     # step with the next chunk. Always restore training mode because
                     # log-prob inference may have switched the model to inference mode.
                     with self._timer.time("training_prep"):
+                        self._train_phase = "prepare_training"
                         await asyncio.to_thread(self._trainer.prepare_for_training)
                     if has_valid_training_tokens:
                         with self._timer.time("policy_training"):
                             if not step_open:
+                                self._train_phase = "begin_train_step"
                                 await asyncio.to_thread(
                                     self._trainer.begin_train_step,
                                     self._loss_fn,
                                 )
                                 step_open = True
+                            self._train_phase = "forward_backward"
                             await asyncio.to_thread(
                                 self._trainer.train_microbatches_from_meta,
                                 train_meta,
@@ -1278,6 +1307,7 @@ class SingleControllerActor:
                             for field in (train_meta.fields or [])
                             if field in DP_CALIB_INPUT_FIELDS
                         ]
+                        self._train_phase = "calibration_dataplane_read"
                         calibration_batches.append(
                             await asyncio.to_thread(
                                 self._trainer.read_from_dataplane,
@@ -1299,6 +1329,7 @@ class SingleControllerActor:
                         min_sample_version = curr_min_sample_version
 
                     # Remove consumed sample_ids from the buffer
+                    self._train_phase = "dataplane_clear_samples"
                     await self._call_dp(
                         "clear_samples",
                         sample_ids=list(train_meta.sample_ids),
@@ -1342,6 +1373,7 @@ class SingleControllerActor:
                     )
 
                 with self._timer.time("policy_training"):
+                    self._train_phase = "finish_train_step"
                     result = await asyncio.to_thread(self._trainer.finish_train_step)
 
                 step_metrics = aggregate_step_metrics(result)
@@ -1522,6 +1554,35 @@ class SingleControllerActor:
                 print("Timeout has been reached, stopping training early", flush=True)
                 break
 
+    def _log_progress(self, idle_s: float) -> None:
+        """Log local wait/ownership evidence without taking locks or making RPCs."""
+        owner = (
+            self._checkpoint_lock_last_owner
+            if self._rollout_checkpoint_lock.locked()
+            else "none"
+        )
+        log.info(
+            "sc_progress utc=%s pid=%s step=%s trainer_version=%s "
+            "committed=%s idle_s=%.1f train_phase=%s rollout_phase=%s "
+            "checkpoint_lock_owner=%s buffer_groups=%s ready_groups=%s "
+            "buffer_limit=%s buffer_capacity_blocked=%s inflight=%s rollout_permitted=%s",
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            os.getpid(),
+            self._train_steps,
+            self._trainer_version,
+            self._rollout_manager.stats.committed,
+            idle_s,
+            self._train_phase,
+            self._rollout_phase,
+            owner,
+            self._buffer.size(),
+            sum(self._buffer.ready_list),
+            self._async_cfg.max_buffered_rollouts,
+            self._buffer_capacity.locked(),
+            self._inflight_rollouts,
+            self._rollout_permitted.is_set(),
+        )
+
     async def _stall_watchdog_pump(self) -> None:
         """Report rollout health, and detect stalls nothing else catches.
 
@@ -1555,6 +1616,8 @@ class SingleControllerActor:
                 last_progress = progress
                 last_progress_at = now
             idle_s = now - last_progress_at
+            # Existing cadence, before health/metrics RPCs that can themselves wait.
+            self._log_progress(idle_s)
 
             metrics = dict(stats.as_metrics())
             metrics["rollout/inflight"] = float(self._inflight_rollouts)
@@ -1818,6 +1881,9 @@ class SingleControllerActor:
         Everything except the (possibly async) policy weight write must be
         on disk before begin_finalization; rollouts keep running throughout.
         """
+        checkpoint_started = time.monotonic()
+        self._train_phase = "checkpoint_lock"
+        log.info("sc_checkpoint step=%s begin", self._train_steps)
         save_state = self._save_state
         save_state.current_step = self._train_steps
         save_state.total_steps = self._train_steps
@@ -1836,6 +1902,7 @@ class SingleControllerActor:
         # waiting at admission, _prefetched_dataloader_state rewinds to before
         # that unaccounted batch.
         async with self._rollout_checkpoint_lock:
+            self._checkpoint_lock_last_owner = "train"
             dataloader_state = (
                 self._prefetched_dataloader_state
                 if self._prefetched_dataloader_state is not None
@@ -1859,6 +1926,7 @@ class SingleControllerActor:
                 if rollout["journal_id"] not in journaled_ids
             )
             pending_rollouts_state["batch_shortfall"] = dict(self._batch_shortfall)
+        log.info("sc_checkpoint step=%s metadata_snapshot_done", self._train_steps)
         # SC has no validation loop yet; drop the default sentinel instead of
         # persisting a bogus val_reward.
         if hasattr(save_state, "val_reward"):
@@ -1875,9 +1943,13 @@ class SingleControllerActor:
 
         # Flush the previous checkpoint's background finalization first;
         # re-raises a failure from it.
+        self._train_phase = "checkpoint_finalize_previous"
+        log.info("sc_checkpoint step=%s phase=%s", self._train_steps, self._train_phase)
         await asyncio.to_thread(self._checkpointer.finalize_pending)
 
         print(f"Saving checkpoint for step {self._train_steps}...")
+        self._train_phase = "checkpoint_create_tmp"
+        log.info("sc_checkpoint step=%s phase=%s", self._train_steps, self._train_phase)
         checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
             self._checkpointer.init_tmp_checkpoint,
             self._train_steps,
@@ -1886,6 +1958,8 @@ class SingleControllerActor:
         )
         # With async_save this returns after D2H staging; disk writes finish
         # in the background.
+        self._train_phase = "checkpoint_policy_save"
+        log.info("sc_checkpoint step=%s phase=%s", self._train_steps, self._train_phase)
         await asyncio.to_thread(
             self._trainer.save_checkpoint,
             weights_path=os.path.join(checkpoint_path, "policy", "weights"),
@@ -1895,6 +1969,11 @@ class SingleControllerActor:
             tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
             checkpointing_cfg=self._master_config.checkpointing,
         )
+        log.info(
+            "sc_checkpoint step=%s policy_save_returned (disk writes may be pending)",
+            self._train_steps,
+        )
+        self._train_phase = "checkpoint_metadata_write"
         await asyncio.to_thread(
             torch.save,
             dataloader_state,
@@ -1911,9 +1990,13 @@ class SingleControllerActor:
                 reserve_state,
                 os.path.join(checkpoint_path, "replacement_reserve.pt"),
             )
+        self._train_phase = "checkpoint_buffer_fetch"
+        log.info("sc_checkpoint step=%s phase=%s", self._train_steps, self._train_phase)
         buffer_state = await self._buffer.state_dict(
             saved_capacity=self._async_cfg.max_buffered_rollouts
         )
+        log.info("sc_checkpoint step=%s buffer_fetch_done", self._train_steps)
+        self._train_phase = "checkpoint_buffer_write"
         await asyncio.to_thread(
             torch.save,
             buffer_state,
@@ -1921,14 +2004,23 @@ class SingleControllerActor:
         )
         # Rename happens in the background once the async weight writes
         # finish; flushed at the next save or on exit.
+        self._train_phase = "checkpoint_begin_finalization"
         self._checkpointer.begin_finalization(
             checkpoint_path,
             wait_fn=self._trainer.finalize_async_save,
         )
+        log.info("sc_checkpoint step=%s finalization_scheduled", self._train_steps)
+        self._train_phase = "checkpoint_latest_status_write"
         await asyncio.to_thread(
             _write_latest_checkpoint_status,
             self._checkpointer,
             last_checkpoint_step=self._train_steps,
+        )
+        self._train_phase = "checkpoint_dispatched"
+        log.info(
+            "sc_checkpoint step=%s dispatched elapsed_s=%.3f (finalization may be pending)",
+            self._train_steps,
+            time.monotonic() - checkpoint_started,
         )
 
     async def _sync_weights(
@@ -1956,6 +2048,7 @@ class SingleControllerActor:
             The number of stale in-flight rollout groups aborted before the
             weight synchronization.
         """
+        self._train_phase = "refit_abort_stale"
         self._rollout_permitted.clear()
 
         # TODO(#2625): Abort unconditionally once Gym-path abort is validated;
@@ -1975,6 +2068,7 @@ class SingleControllerActor:
             and calibration_data is not None
         ):
             print("▶ Computing KV cache scales...", flush=True)
+            self._train_phase = "refit_calibration"
             calibration_result = await asyncio.to_thread(
                 self._trainer.calibrate_qkv_fp8_scales,
                 calibration_data,
@@ -1982,6 +2076,7 @@ class SingleControllerActor:
             )
             kv_scales = calibration_result["layers"]
 
+        self._train_phase = "refit_sync_weights"
         await asyncio.to_thread(
             self._weight_synchronizer.sync_weights,
             kv_scales=kv_scales,
@@ -1991,12 +2086,14 @@ class SingleControllerActor:
             # the loop this is a blocking Ray call, and a wedged generation worker would
             # freeze the event loop itself -- taking the watchdog, which is an asyncio
             # task on that same loop, down with it.
+            self._train_phase = "refit_invalidate_kv_cache"
             await asyncio.to_thread(self._gen.invalidate_kv_cache)
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
         self._rollout_manager.set_weight_version(self._trainer_version)
         self._rollout_permitted.set()
+        self._train_phase = "refit_complete"
         return aborted_stale_inflight_groups
 
     async def _advantage_stage(self, meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
@@ -2016,6 +2113,7 @@ class SingleControllerActor:
             return meta, True
         adv_cfg = self._advantage_cfg
 
+        self._train_phase = "advantage_dataplane_get"
         data = await self._call_dp(
             "get_samples",
             sample_ids=meta.sample_ids,
@@ -2141,6 +2239,7 @@ class SingleControllerActor:
         if not torch.equal(final_sample_mask, sample_mask):
             fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
 
+        self._train_phase = "advantage_dataplane_put"
         await self._call_dp(
             "put_samples",
             sample_ids=meta.sample_ids,

@@ -24,6 +24,7 @@ property that matters: "no group has landed" is the symptom, whatever the cause.
 """
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -84,6 +85,15 @@ def _make_controller(
     ctrl._rollout_manager = SimpleNamespace(stats=stats)
     ctrl._inflight_rollouts = inflight
     ctrl._train_steps = train_steps
+    ctrl._trainer_version = train_steps
+    ctrl._train_phase = "ready_groups"
+    ctrl._rollout_phase = "sampler_admission"
+    ctrl._checkpoint_lock_last_owner = None
+    ctrl._buffer = SimpleNamespace(size=lambda: 0, ready_list=[])
+    ctrl._async_cfg.max_buffered_rollouts = 8
+    ctrl._buffer_capacity = asyncio.Semaphore(1)
+    ctrl._rollout_checkpoint_lock = asyncio.Lock()
+    ctrl._rollout_permitted = asyncio.Event()
     ctrl._logger = _RecordingLogger()
     ctrl._env_handles = env_handles if env_handles is not None else {}
     # These tests cover stall detection, not fleet health or gym routing.
@@ -206,6 +216,57 @@ class TestStallDetection:
                 await task
 
         asyncio.run(_main())
+
+
+class TestProgressLogging:
+    def test_waits_and_lock_owner_survive_handoff_and_cancellation(self, caplog):
+        caplog.set_level(logging.INFO, logger="nemo_rl.algorithms.single_controller")
+        ctrl = _make_controller(stats=RolloutStats(), inflight=0, stall_timeout_s=1000)
+        ctrl._train_phase = "checkpoint_lock"
+        ctrl._rollout_phase = "buffer_capacity"
+
+        async def _main():
+            acquired = asyncio.Event()
+
+            async def _rollout():
+                async with ctrl._rollout_checkpoint_lock:
+                    ctrl._checkpoint_lock_last_owner = "rollout"
+                    acquired.set()
+                    await ctrl._buffer_capacity.acquire()
+                    await ctrl._buffer_capacity.acquire()
+
+            task = asyncio.create_task(_rollout())
+            await acquired.wait()
+            ctrl._log_progress(30.0)
+            assert (
+                "train_phase=checkpoint_lock rollout_phase=buffer_capacity"
+                in caplog.text
+            )
+            assert "checkpoint_lock_owner=rollout" in caplog.text
+            assert "buffer_capacity_blocked=True" in caplog.text
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            caplog.clear()
+            ctrl._log_progress(31.0)
+            assert "checkpoint_lock_owner=none" in caplog.text
+            async with ctrl._rollout_checkpoint_lock:
+                ctrl._checkpoint_lock_last_owner = "train"
+                caplog.clear()
+                ctrl._log_progress(32.0)
+                assert "checkpoint_lock_owner=train" in caplog.text
+
+        asyncio.run(_main())
+
+    def test_periodic_status_precedes_stall_abort(self, caplog):
+        caplog.set_level(logging.INFO, logger="nemo_rl.algorithms.single_controller")
+        ctrl = _make_controller(
+            stats=RolloutStats(), inflight=0, stall_timeout_s=0, stall_action="abort"
+        )
+        with pytest.raises(RolloutStall):
+            asyncio.run(ctrl._stall_watchdog_pump())
+        assert "sc_progress utc=" in caplog.text
+        assert "train_phase=ready_groups" in caplog.text
 
 
 class TestMetrics:

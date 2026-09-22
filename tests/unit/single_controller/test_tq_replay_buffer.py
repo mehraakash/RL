@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 import torch
@@ -654,13 +656,37 @@ def _load(
 
 
 class TestTQReplayBufferStateDict:
-    def test_state_dict_serializes_ready_and_skips_unready(self):
+    @pytest.mark.parametrize(
+        "error", [RuntimeError("fetch failed"), asyncio.CancelledError()]
+    )
+    def test_fetch_logging_preserves_failure_and_cancellation(
+        self, error, caplog, monkeypatch
+    ):
+        caplog.set_level(logging.INFO, logger=_replay_buffer_module.__name__)
+        buf = _make_buffer(FakeDataPlaneClient())
+        _add_group(buf, weight=1)
+        monkeypatch.setattr(buf, "_call_dp", AsyncMock(side_effect=error))
+        with pytest.raises(type(error)) as caught:
+            _run(buf.state_dict(saved_capacity=8))
+        assert caught.value is error
+        assert "buffer_fetch begin group_id=" in caplog.text
+        assert "buffer_fetch failed group_id=" in caplog.text
+        assert f"error_type={type(error).__name__}" in caplog.text
+        assert "buffer_fetch done" not in caplog.text
+        assert buf.size() == 1
+
+    def test_state_dict_serializes_ready_and_skips_unready(self, caplog):
+        caplog.set_level(logging.INFO, logger=_replay_buffer_module.__name__)
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
         metas = [_add_group(buf, weight=w) for w in (1, 2)]
         buf.reserve(weight_version=3)  # in-flight: must be excluded
 
         state = _run(buf.state_dict(saved_capacity=8))
+
+        assert caplog.text.count("buffer_fetch begin group_id=") == 2
+        assert caplog.text.count("buffer_fetch done group_id=") == 2
+        assert "payload_for" not in caplog.text
 
         assert state["partition_id"] == "rollout_data"
         assert state["saved_capacity"] == 8

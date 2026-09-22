@@ -14,8 +14,10 @@
 
 import asyncio
 import gc
+import logging
 import statistics
 import threading as _threading
+import time
 import uuid
 from collections import Counter
 from collections.abc import Mapping
@@ -39,6 +41,8 @@ from nemo_rl.experience.payload import (
     record_to_train_batch,
 )
 from nemo_rl.utils.r3_trace import trace_rollout_payload
+
+log = logging.getLogger(__name__)
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -997,11 +1001,31 @@ class TQReplayBuffer:
             prompt,
             journal_id,
         ) in snapshot:
-            fields_data = await self._call_dp(
-                "get_samples",
-                sample_ids=meta.sample_ids,
-                partition_id=self._partition_id,
-                select_fields=meta.fields,
+            fetch_started = time.monotonic()
+            log.info(
+                "sc_checkpoint buffer_fetch begin group_id=%s rows=%s",
+                group_id,
+                len(meta.sample_ids),
+            )
+            try:
+                fields_data = await self._call_dp(
+                    "get_samples",
+                    sample_ids=meta.sample_ids,
+                    partition_id=self._partition_id,
+                    select_fields=meta.fields,
+                )
+            except (Exception, asyncio.CancelledError) as error:
+                log.warning(
+                    "sc_checkpoint buffer_fetch failed group_id=%s error_type=%s elapsed_s=%.3f",
+                    group_id,
+                    type(error).__name__,
+                    time.monotonic() - fetch_started,
+                )
+                raise
+            log.info(
+                "sc_checkpoint buffer_fetch done group_id=%s elapsed_s=%.3f",
+                group_id,
+                time.monotonic() - fetch_started,
             )
             groups.append(
                 {
